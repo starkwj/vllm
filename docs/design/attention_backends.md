@@ -257,3 +257,21 @@ to the selected candidate blocks. Its top-k options are `auto` (per row),
 `per_row`, and `torch`. Speculative decoding, context parallelism,
 LoRA, and image inputs are unsupported. Checkpoint loading and MoE kernel
 support depend on the model's weight format and are separate from this backend.
+
+On eight A100s, the official DeepSeek-V4.1-Flash-1017 checkpoint can run
+directly with Marlin for the FP8 linears (W8A16) and MXFP4 routed experts
+(W4A16). The grouped attention output projection (`wo_a`) uses BF16 batched
+matrix multiplication. Engram tables can be sharded across the tensor-parallel
+ranks in pinned host memory. The following configuration uses a 1024-token
+context and at most two concurrent sequences.
+
+```bash
+vllm serve /path/to/DeepSeek-V4.1-Flash-1017 \
+    --tokenizer-mode deepseek_v41 --tensor-parallel-size 8 --enable-expert-parallel \
+    --linear-backend marlin --moe-backend marlin --engram-config '{"cpu_offload":true}' \
+    --attention-config '{"backend":"TRITON_MLA_SPARSE_DSV41"}' \
+    --enforce-eager --language-model-only --dtype bfloat16 --kv-cache-dtype fp8 \
+    --block-size 128 --no-swa-bounded-replay --max-model-len 1024 \
+    --max-num-batched-tokens 256 --max-num-seqs 2 --gpu-memory-utilization 0.8 \
+    --safetensors-load-strategy lazy
+```

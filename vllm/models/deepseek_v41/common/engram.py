@@ -76,6 +76,7 @@ from vllm.models.deepseek_v41.common.ops.query_quant import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.fp8 import fp8_e4m3fn_from_uint8, needs_software_e4m3fn
 from vllm.utils.cpu_resource_utils import get_available_memory
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -660,6 +661,7 @@ def _engram_lookup_kernel(
     SORTED: tl.constexpr if _SORTED_IS_CONSTEXPR else None,  # type: ignore[valid-type]
     PACKED: tl.constexpr,
     OUT_STRIDE: tl.constexpr,
+    USE_SOFTWARE_FP8: tl.constexpr,
     PEER_ROWS: tl.constexpr = 0,
 ):
     """Gather FP8 rows as packed values/scales or dequantized BF16.
@@ -696,14 +698,15 @@ def _engram_lookup_kernel(
             owner = local // PEER_ROWS
             peer = tl.load(weight + owner, mask=owned, other=0)
             local -= owner * PEER_ROWS
-            row_weight = peer.to(tl.pointer_type(tl.float8e4nv))
+            weight_dtype: tl.constexpr = tl.uint8 if USE_SOFTWARE_FP8 else tl.float8e4nv
+            row_weight = peer.to(tl.pointer_type(weight_dtype))
             row_scales = (peer + PEER_ROWS * DIM).to(tl.pointer_type(tl.uint8))
         else:
             row_weight, row_scales = weight, scales
         row_weight += local * DIM
         row_scales += local * (DIM // QUANT_BLOCK)
         values = tl.load(
-            row_weight[:, None] + cols[None, :], mask=owned[:, None], other=0.0
+            row_weight[:, None] + cols[None, :], mask=owned[:, None], other=0
         )
         scale = tl.load(
             row_scales[:, None] + scale_cols[None, :], mask=owned[:, None], other=0
@@ -725,9 +728,13 @@ def _engram_lookup_kernel(
         else:
             # ue8m0 is a power of two, so its byte *is* the fp32 exponent field.
             scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            if USE_SOFTWARE_FP8:
+                values_fp32 = fp8_e4m3fn_from_uint8(values, True)
+            else:
+                values_fp32 = values.to(tl.float32)
             tl.store(
                 out + dst[:, None] * DIM + cols[None, :],
-                (values.to(tl.float32) * scale).to(tl.bfloat16),
+                (values_fp32 * scale).to(tl.bfloat16),
                 mask=valid[:, None],
             )
 
@@ -1266,6 +1273,9 @@ class ParallelEngramEmbedding(nn.Module):
         if not rows:
             return
         weight, scales = self._storage()
+        use_software_fp8 = needs_software_e4m3fn(indices.device)
+        if use_software_fp8:
+            weight = weight.view(torch.uint8)
         ids_stride_t, ids_stride_h = indices.stride()
         sort_min_rows, _ = _engram_lookup_thresholds(indices.device)
         sort = (
@@ -1308,6 +1318,7 @@ class ParallelEngramEmbedding(nn.Module):
             SORTED=sort,
             PACKED=out.dtype == torch.uint8,
             OUT_STRIDE=out.stride(0),
+            USE_SOFTWARE_FP8=use_software_fp8,
             PEER_ROWS=self.peer_rows,
         )
 
