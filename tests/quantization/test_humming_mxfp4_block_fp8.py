@@ -128,28 +128,39 @@ def test_default_activation_quant_config_defers_to_humming():
 
 @pytest.mark.skipif(not has_humming(), reason="humming is not installed")
 @pytest.mark.parametrize(
-    "capability,user_override,expected_group_size",
+    "capability,user_override,expected_activation",
     [
-        (90, None, 128),
-        (90, kMxfp8Dynamic, 32),
-        (100, None, 32),
+        ((8, 0), None, None),
+        ((8, 0), kMxfp8Dynamic, kMxfp8Dynamic),
+        ((8, 9), None, kMxfp8Dynamic),
+        ((9, 0), None, kFp8Dynamic128Sym),
+        ((9, 0), kMxfp8Dynamic, kMxfp8Dynamic),
+        ((10, 0), None, kMxfp8Dynamic),
     ],
 )
-def test_checkpoint_mxfp8_runs_as_block_fp8_on_hopper(
-    monkeypatch, capability, user_override, expected_group_size
+def test_humming_checkpoint_mxfp8_activation_schema(
+    monkeypatch, capability, user_override, expected_activation
 ):
-    """A checkpoint's MXFP8 MoE activations (e.g. DeepSeek V4) run as block
-    FP8 on Humming's SM90 kernels; an explicit user request is honored."""
+    """Check Humming's device defaults and preserve explicit requests."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config.quantization import QuantSpec, layer_target_spec_scope
     from vllm.model_executor.layers.fused_moe.oracle import mxfp4
+    from vllm.model_executor.layers.quantization.utils.humming import (
+        input_schema_to_quant_key,
+    )
     from vllm.platforms import current_platform
+    from vllm.platforms.interface import DeviceCapability
 
     monkeypatch.setattr(
-        current_platform, "is_device_capability_family", lambda cap: cap == capability
+        type(current_platform),
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(*capability)),
     )
-    monkeypatch.setattr(mxfp4, "_user_moe_activation_override", lambda: user_override)
     monkeypatch.delenv("VLLM_HUMMING_INPUT_QUANT_CONFIG", raising=False)
 
-    schema = mxfp4._humming_input_schema(kMxfp8Dynamic)
+    spec = QuantSpec(activation=user_override) if user_override is not None else None
+    with set_current_vllm_config(VllmConfig()), layer_target_spec_scope(spec):
+        schema = mxfp4._humming_input_schema(kMxfp8Dynamic)
 
-    assert str(schema.a_dtype) == "float8e4m3"
-    assert schema.input_scale_group_size == expected_group_size
+    assert schema is not None
+    assert input_schema_to_quant_key(schema, torch.bfloat16) == expected_activation
