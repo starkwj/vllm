@@ -276,6 +276,12 @@ vllm serve /path/to/DeepSeek-V4.1-Flash-1017 \
     --safetensors-load-strategy lazy
 ```
 
+Set `--moe-backend triton` to select `TritonMxfp4W4A16Experts` for the
+checkpoint's routed experts on SM80 with `--dtype bfloat16`. The kernel
+keeps the E2M1 weights packed with their group-of-32 UE8M0 scales, decoding
+tiles into BF16 Tensor Core operands as it computes. Keep
+`--linear-backend marlin` to use the same FP8 linear path as above.
+
 Set `--moe-backend humming` for MXFP4 routed experts or
 `--linear-backend humming` for the ordinary FP8 linears. You can set either
 flag independently or use both. On SM80 with `--dtype bfloat16`, Humming
