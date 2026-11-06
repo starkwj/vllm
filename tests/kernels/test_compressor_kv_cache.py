@@ -32,6 +32,7 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
 from vllm.models.deepseek_v4.compressor import _get_c128_boundary
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.fp8 import fp8_e4m3fn_from_uint8, fp8_e4m3fn_to_uint8
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
@@ -41,6 +42,50 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
 )
 
 from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
+
+
+@triton.jit
+def _software_e4m3fn_round_trip(values, codes, encoded, decoded, N: tl.constexpr):
+    i = tl.arange(0, triton.next_power_of_2(N))
+    x = tl.load(values + i, i < N, other=0.0)
+    byte = tl.load(codes + i, i < 256, other=0)
+    tl.store(encoded + i, fp8_e4m3fn_to_uint8(x, True), i < N)
+    tl.store(decoded + i, fp8_e4m3fn_from_uint8(byte, True), i < 256)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+def test_software_e4m3fn_byte_conversion():
+    codes = torch.arange(256, dtype=torch.int32).to(torch.uint8)
+    reference = codes.view(torch.float8_e4m3fn).float()
+    positive = reference[:127]
+    midpoints = (positive[1:] + positive[:-1]) / 2
+    edges = torch.cat(
+        (
+            positive,
+            midpoints,
+            torch.nextafter(midpoints, positive[:-1]),
+            torch.nextafter(midpoints, positive[1:]),
+        )
+    )
+    extremes = torch.tensor([-512.0, 512.0, -float("inf"), float("inf"), float("nan")])
+    values = torch.cat((edges, -edges, extremes))
+
+    encoded = torch.empty_like(values, dtype=torch.uint8, device="cuda")
+    decoded = torch.empty_like(reference, device="cuda")
+    _software_e4m3fn_round_trip[(1,)](
+        values.cuda(), codes.cuda(), encoded, decoded, values.numel()
+    )
+
+    expected = values.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
+    torch.testing.assert_close(encoded.cpu()[:-1], expected[:-1], rtol=0, atol=0)
+    assert (encoded[-1].item() & 0x7F) == 0x7F
+    decoded = decoded.cpu()
+    finite = reference.isfinite()
+    assert torch.equal(decoded.isnan(), reference.isnan())
+    # Compare bits so the sign of zero is checked too.
+    assert torch.equal(
+        decoded[finite].view(torch.int32), reference[finite].view(torch.int32)
+    )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
