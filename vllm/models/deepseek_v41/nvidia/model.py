@@ -94,6 +94,10 @@ from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferSM120Attention,
 )
 from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
+from vllm.models.deepseek_v41.nvidia.triton_sparse import (
+    DeepseekV41TritonSparseMLAAttention,
+    DeepseekV41TritonSparseMLABackend,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -205,11 +209,26 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
 
     The generic CUDA backend selector does not instantiate DSv4 layers directly,
     so map generic sparse-MLA choices to the DSv4-specialized attention class.
-    Without an explicit backend: SM12 takes FlashInfer, SM100 takes mega
-    attention where the topology allows it, and everything else keeps the
-    FlashMLA path.
+    SM80 takes Triton, SM12 takes FlashInfer, and SM100 takes mega attention
+    where the topology allows it. Other devices keep the FlashMLA default.
     """
     backend = vllm_config.attention_config.backend
+    device_capability = current_platform.get_device_capability()
+    is_sm80 = (
+        current_platform.is_cuda()
+        and device_capability is not None
+        and DeepseekV41TritonSparseMLABackend.supports_compute_capability(
+            device_capability
+        )
+    )
+    triton_backend = AttentionBackendEnum.TRITON_MLA_SPARSE_DSV41
+    if backend is triton_backend or is_sm80:
+        if not is_sm80:
+            raise ValueError(f"{triton_backend.name} requires an SM80 CUDA GPU.")
+        if backend not in (None, triton_backend):
+            raise ValueError(f"DeepSeek V4.1 on SM80 requires {triton_backend.name}.")
+        DeepseekV41TritonSparseMLAAttention.validate_config(vllm_config)
+        return DeepseekV41TritonSparseMLAAttention
     if vllm_config.parallel_config.prefill_context_parallel_size > 1:
         if backend not in (
             None,
@@ -221,7 +240,6 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
                 "DeepSeek-V4.1 PCP requires FlashMLA sparse attention."
             )
         return DeepseekV4FlashMLAAttention
-    device_capability = current_platform.get_device_capability()
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,

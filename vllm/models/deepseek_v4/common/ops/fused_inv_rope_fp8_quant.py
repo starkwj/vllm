@@ -170,55 +170,58 @@ class FusedInvRopeFP8QuantKernel(
             + head_in_group[:, None] * HEAD_DIM
             + offsets[None, :]
         )
-        if not QUANTIZE:
-            tl.store(out_ptrs, x)
-            return
+        # Keep the FP8 conversion out of the SM80 BF16 specialization.
+        if QUANTIZE:
+            x_3d = tl.reshape(tl.abs(x), (BLOCK_H, CHUNKS_PER_HEAD, QUANT_GROUP_SIZE))
+            block_absmax = tl.maximum(tl.max(x_3d, axis=2), eps)
+            scale_raw = block_absmax * (1.0 / fp8_max)
+            scales = tl.math.exp2(tl.ceil(tl.log2(scale_raw)))
 
-        x_3d = tl.reshape(tl.abs(x), (BLOCK_H, CHUNKS_PER_HEAD, QUANT_GROUP_SIZE))
-        block_absmax = tl.maximum(tl.max(x_3d, axis=2), eps)
-        scale_raw = block_absmax * (1.0 / fp8_max)
-        scales = tl.math.exp2(tl.ceil(tl.log2(scale_raw)))
-
-        scales_exp = tl.reshape(
-            tl.broadcast_to(
-                tl.reshape(scales, (BLOCK_H, CHUNKS_PER_HEAD, 1)),
-                (BLOCK_H, CHUNKS_PER_HEAD, QUANT_GROUP_SIZE),
-            ),
-            (BLOCK_H, HEAD_DIM),
-        )
-        x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
-        tl.store(out_ptrs, x_quant)
-
-        if TMA_ALIGNED_SCALES:
-            scale_bits = scales.to(tl.int32, bitcast=True)
-            ue8m0_bytes = (scale_bits >> 23) & 0xFF
-            packed_val = tl.sum(
-                tl.reshape(ue8m0_bytes, (BLOCK_H, CHUNKS_PER_HEAD // 4, 4))
-                << (tl.arange(0, 4)[None, None, :] * 8),
-                axis=2,
+            scales_exp = tl.reshape(
+                tl.broadcast_to(
+                    tl.reshape(scales, (BLOCK_H, CHUNKS_PER_HEAD, 1)),
+                    (BLOCK_H, CHUNKS_PER_HEAD, QUANT_GROUP_SIZE),
+                ),
+                (BLOCK_H, HEAD_DIM),
             )
-            packed_offsets = tl.arange(0, CHUNKS_PER_HEAD // 4)
-            scale_addr = (
-                scale_ptr
-                + g * scale_stride_group
-                + pid_token
-                + (
-                    head_in_group[:, None] * (CHUNKS_PER_HEAD // 4)
-                    + packed_offsets[None, :]
+            x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+            tl.store(out_ptrs, x_quant)
+
+            if TMA_ALIGNED_SCALES:
+                scale_bits = scales.to(tl.int32, bitcast=True)
+                ue8m0_bytes = (scale_bits >> 23) & 0xFF
+                packed_val = tl.sum(
+                    tl.reshape(ue8m0_bytes, (BLOCK_H, CHUNKS_PER_HEAD // 4, 4))
+                    << (tl.arange(0, 4)[None, None, :] * 8),
+                    axis=2,
                 )
-                * scale_stride_k
-            )
-            tl.store(scale_addr, packed_val)
+                packed_offsets = tl.arange(0, CHUNKS_PER_HEAD // 4)
+                scale_addr = (
+                    scale_ptr
+                    + g * scale_stride_group
+                    + pid_token
+                    + (
+                        head_in_group[:, None] * (CHUNKS_PER_HEAD // 4)
+                        + packed_offsets[None, :]
+                    )
+                    * scale_stride_k
+                )
+                tl.store(scale_addr, packed_val)
+            else:
+                block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
+                scale_addrs = (
+                    scale_ptr
+                    + g * scale_stride_group
+                    + pid_token
+                    + (
+                        head_in_group[:, None] * CHUNKS_PER_HEAD
+                        + block_offsets[None, :]
+                    )
+                    * scale_stride_k
+                )
+                tl.store(scale_addrs, scales)
         else:
-            block_offsets = tl.arange(0, CHUNKS_PER_HEAD)
-            scale_addrs = (
-                scale_ptr
-                + g * scale_stride_group
-                + pid_token
-                + (head_in_group[:, None] * CHUNKS_PER_HEAD + block_offsets[None, :])
-                * scale_stride_k
-            )
-            tl.store(scale_addrs, scales)
+            tl.store(out_ptrs, x)
 
     def dispatch(  # type: ignore[override]
         self,
