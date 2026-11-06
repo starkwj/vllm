@@ -1230,6 +1230,8 @@ class SparseAttnIndexer(CustomOp):
     `custom_ops` in `CompilationConfig` to enable the platform specific path.
     """
 
+    requires_deep_gemm = True
+
     def __init__(
         self,
         k_cache,
@@ -1279,13 +1281,17 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if (
+            self.requires_deep_gemm
+            and current_platform.is_cuda()
+            and not has_deep_gemm()
+        ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."
             )
 
-        if vllm_config.kernel_config.enable_jit_warmup:
+        if vllm_config.kernel_config.enable_jit_warmup and self.requires_deep_gemm:
             from vllm.v1.attention.ops.common import (
                 _PACK_SEQ_TRITON_KERNEL,
                 _UNPACK_SEQ_TRITON_KERNEL,

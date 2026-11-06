@@ -450,6 +450,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     reorder_batch_threshold: int | None = None
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     supports_draft_decode_metadata_update = True
+    use_flashmla_tile_scheduler: ClassVar[bool] = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -931,6 +932,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         }
         if (
             num_decode_tokens == 0
+            or not self.use_flashmla_tile_scheduler
             or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
