@@ -173,6 +173,7 @@ class Mxfp4MoeBackend(Enum):
     # Triton
     TRITON = "TRITON"
     TRITON_UNFUSED = "TRITON_UNFUSED"
+    TRITON_MXFP4_W4A16 = "TRITON_MXFP4_W4A16"
     # XPU
     XPU = "XPU"
     # CPU
@@ -276,6 +277,13 @@ def backend_to_kernel_cls(
         )
 
         return [UnfusedOAITritonExperts]
+
+    elif backend == Mxfp4MoeBackend.TRITON_MXFP4_W4A16:
+        from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
+            TritonMxfp4W4A16Experts,
+        )
+
+        return [TritonMxfp4W4A16Experts]
 
     elif backend == Mxfp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
@@ -791,6 +799,21 @@ def select_deepseek_v4_mxfp4_moe_backend(
     # Honor explicit moe_backend (e.g. "marlin", "triton_unfused") before
     # falling back to the auto priority list.
     runner_backend = config.moe_backend
+    if (
+        runner_backend == "triton"
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(80)
+    ):
+        activation_key, _ = user_activation_override(
+            "moe", get_current_vllm_config_or_none()
+        )
+        return _return_or_raise(
+            Mxfp4MoeBackend.TRITON_MXFP4_W4A16,
+            config,
+            kMxfp4Static,
+            activation_key,
+            activation_format,
+        )
     if runner_backend != "auto":
         if runner_backend == "b12x":
             requested_backends = _get_requested_backends(runner_backend, None)
@@ -860,9 +883,8 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     if backend in FLASHINFER_MOE_EP_MXFP4_BACKENDS:
         # The megakernel takes the model's dimensions and validates them itself.
         return hidden_size, intermediate_size
-    if backend in B12X_BACKENDS:
-        # b12x plans for the exact model dimensions. B12xExperts validates the
-        # required MXFP4 block alignment before selecting the backend.
+    if backend in B12X_BACKENDS or backend == Mxfp4MoeBackend.TRITON_MXFP4_W4A16:
+        # These kernels validate MXFP4 block alignment at selection time.
         return hidden_size, intermediate_size
     if backend == Mxfp4MoeBackend.EMULATION:
         # Emulation has no kernel tile; it only needs OCP MX block alignment so the
@@ -1605,7 +1627,10 @@ def convert_weight_to_mxfp4_moe_kernel_format(
 
         is_gfx1250 = on_gfx1250()
 
-    if mxfp4_backend in B12X_BACKENDS:
+    if (
+        mxfp4_backend in B12X_BACKENDS
+        or mxfp4_backend == Mxfp4MoeBackend.TRITON_MXFP4_W4A16
+    ):
         return (
             w13_weight.data,
             w2_weight.data,
@@ -2207,6 +2232,7 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.B12X_MXFP4_BF16,
         Mxfp4MoeBackend.MARLIN,
         Mxfp4MoeBackend.BATCHED_MARLIN,
+        Mxfp4MoeBackend.TRITON_MXFP4_W4A16,
         Mxfp4MoeBackend.TRITON,
         Mxfp4MoeBackend.TRITON_UNFUSED,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,

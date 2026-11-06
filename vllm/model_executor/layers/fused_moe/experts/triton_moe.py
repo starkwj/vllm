@@ -42,6 +42,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     is_deep_gemm_e8m0_used,
 )
+from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import OCP_MX_BLOCK_SIZE
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP8_DTYPE,
     QuantKey,
@@ -60,6 +61,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8Static,
     kInt8StaticChannelSym,
     kInt8StaticTensorSym,
+    kMxfp4Static,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -103,6 +105,8 @@ def _silu_mul_quant_sorted_kernel(
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
     """Triton-based fused MoE expert implementation."""
+
+    _use_mxfp4_w4a16 = False
 
     @staticmethod
     def is_supported_config(
@@ -311,7 +315,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         apply_router_weight_on_input: bool,
     ):
         # Check constraints.
-        if self.quant_config.use_int4_w4a16:
+        if self.quant_config.use_int4_w4a16 or self._use_mxfp4_w4a16:
             assert hidden_states.size(-1) // 2 == w1.size(2), "Hidden size mismatch"
         else:
             assert hidden_states.size(-1) == w1.size(2), (
@@ -545,6 +549,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 block_shape=self.block_shape,
                 B_bias=self.w1_bias,
                 C_is_sorted=use_sorted_a,
+                use_mxfp4_w4a16=self._use_mxfp4_w4a16,
             )
 
         if lora_context is not None and lora_context.aux_stream is not None:
@@ -706,6 +711,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 block_shape=self.block_shape,
                 B_bias=self.w2_bias,
                 A_is_sorted=use_sorted_a,
+                use_mxfp4_w4a16=self._use_mxfp4_w4a16,
             )
 
         if lora_context is not None and lora_context.aux_stream is not None:
@@ -780,6 +786,46 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             ops.moe_sum(input, output, topk_ids, expert_map)
         else:
             ops.moe_sum(input, output)
+
+
+class TritonMxfp4W4A16Experts(TritonExperts):
+    """SM80 experts that consume checkpoint MXFP4 weights and BF16 inputs."""
+
+    _use_mxfp4_w4a16 = True
+
+    @staticmethod
+    def _supports_current_device() -> bool:
+        return current_platform.is_cuda() and current_platform.is_device_capability(80)
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return weight_key == kMxfp4Static and activation_key is None
+
+    @staticmethod
+    def supports_lora() -> bool:
+        return False
+
+    @staticmethod
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        if moe_config.in_dtype != torch.bfloat16:
+            return False, "SM80 Triton MXFP4 requires BF16 activations"
+        if (
+            moe_config.hidden_dim % OCP_MX_BLOCK_SIZE
+            or moe_config.intermediate_size_per_partition % OCP_MX_BLOCK_SIZE
+        ):
+            return False, "MXFP4 expert dimensions must be multiples of 32"
+        return TritonExperts.is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        )
 
 
 class TritonWNA16Experts(TritonExperts):

@@ -31,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
     resolve_moe_use_td,
     warn_if_moe_use_td_ineffective,
 )
+from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import OCP_MX_BLOCK_SIZE
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils.allocation import set_triton_allocator
@@ -117,7 +118,8 @@ def fused_moe_kernel_gptq_awq(
     - A: The input tensor representing tokens with shape (*, K), where '*' can
         be any shape representing batches and K is the feature dimension of
         each token.
-    - B: The stacked MOE weight tensor with shape (E, N, K), where E is
+    - B: The stacked MOE weight tensor with shape (E, N, K), or (E, N, K//2)
+        for packed MXFP4. E is
         the number of experts, K is the input feature dimension, and N is
         the output feature dimension.
     - C: The output cache tensor with shape (M, topk, N), where M is the
@@ -356,6 +358,7 @@ def fused_moe_kernel(
     USE_TMA_B: tl.constexpr = False,
     USE_TMA_A: tl.constexpr = False,
     C_IS_SORTED: tl.constexpr = False,
+    USE_MXFP4_W4A16: tl.constexpr = False,
 ):
     """Implements the fused computation for a Mixture of Experts (MOE) using
     token and expert matrices.
@@ -444,6 +447,9 @@ def fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    B_BLOCK_SIZE_K: tl.constexpr = (
+        BLOCK_SIZE_K // 2 if USE_MXFP4_W4A16 else BLOCK_SIZE_K
+    )
     # TD gather and the SWAP_AB accumulator layout are mutually exclusive.
     tl.static_assert(not (USE_TD and SWAP_AB))
     tl.static_assert(not (USE_TD and USE_TMA_B))
@@ -480,10 +486,19 @@ def fused_moe_kernel(
             a_ptrs = a_ptr + (
                 offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
             )
+        offs_bk = tl.arange(0, B_BLOCK_SIZE_K)
         b_ptrs = (
             b_ptr
             + off_experts * stride_be
-            + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+            + (offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        )
+    if USE_MXFP4_W4A16:
+        offs_bsk = tl.arange(0, BLOCK_SIZE_K // group_k)
+        b_scale_ptrs = (
+            b_scale_ptr
+            + off_experts * stride_bse
+            + offs_bn[:, None] * stride_bsn
+            + offs_bsk[None, :] * stride_bsk
         )
     if use_int8_w8a16:
         b_scale_ptrs = (
@@ -551,7 +566,15 @@ def fused_moe_kernel(
                 mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                 other=0.0,
             )
-            if not USE_TMA_B:
+            if USE_MXFP4_W4A16:
+                remaining_k = K - k * BLOCK_SIZE_K
+                b = tl.load(b_ptrs, mask=offs_bk[:, None] < remaining_k // 2, other=0)
+                b_scale = tl.load(
+                    b_scale_ptrs,
+                    mask=offs_bsk[None, :] < remaining_k // group_k,
+                    other=127,
+                )
+            elif not USE_TMA_B:
                 b = tl.load(
                     b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
                 )
@@ -562,7 +585,13 @@ def fused_moe_kernel(
             if not SWAP_AB:
                 b = b.T
         # We accumulate along the K dimension.
-        if use_int8_w8a16:
+        if USE_MXFP4_W4A16:
+            # On SM80 Triton decodes just this tile to BF16 before MMA.
+            accumulator = tl.dot_scaled(
+                a, None, "bf16", b, b_scale, "e2m1", acc=accumulator
+            )
+            b_scale_ptrs += (BLOCK_SIZE_K // group_k) * stride_bsk
+        elif use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
         elif use_fp8_w8a8 or use_int8_w8a8:
             if group_k > 0 and group_n > 0:
@@ -591,7 +620,7 @@ def fused_moe_kernel(
             # Advance the ptrs to the next K block.
             if not USE_TMA_A:
                 a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_ptrs += BLOCK_SIZE_K * stride_bk
+            b_ptrs += B_BLOCK_SIZE_K * stride_bk
 
     if SWAP_AB:
         accumulator = tl.trans(accumulator, (1, 0))
@@ -815,6 +844,7 @@ def invoke_fused_moe_triton_kernel(
     B_bias: torch.Tensor | None = None,
     A_is_sorted: bool = False,
     C_is_sorted: bool = False,
+    use_mxfp4_w4a16: bool = False,
 ):
     assert topk_weights is not None or not mul_routed_weight
     if topk_weights is not None and not topk_weights.is_contiguous():
@@ -840,7 +870,14 @@ def invoke_fused_moe_triton_kernel(
         # (Triton raises "no allocator was set" otherwise on CUDA).
         set_triton_allocator(A.device)
 
-    if use_fp8_w8a8 or use_int8_w8a8:
+    if use_mxfp4_w4a16:
+        assert A.dtype == torch.bfloat16 and A_scale is None
+        assert B.dtype == torch.uint8 and B_scale is not None
+        assert B_scale.dtype == torch.uint8 and block_shape is None
+        assert A.size(1) == B.size(2) * 2
+        assert A.size(1) % OCP_MX_BLOCK_SIZE == 0
+        assert B_scale.shape == (*B.shape[:2], A.size(1) // OCP_MX_BLOCK_SIZE)
+    elif use_fp8_w8a8 or use_int8_w8a8:
         assert B_scale is not None
         assert block_shape is None or triton.cdiv(
             B.size(-2), block_shape[0]
@@ -878,7 +915,11 @@ def invoke_fused_moe_triton_kernel(
     config = config.copy()
     config["SPLIT_K"] = 1
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
-    if block_shape is not None:
+    group_n, group_k = block_shape or (0, 0)
+    if use_mxfp4_w4a16:
+        group_k = OCP_MX_BLOCK_SIZE
+        assert BLOCK_SIZE_K % group_k == 0
+    elif block_shape is not None:
         BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
     use_tma_b = (
         bool(config.pop("USE_TMA", True))
@@ -948,7 +989,7 @@ def invoke_fused_moe_triton_kernel(
         num_tokens_post_padded,
         a_desc,
         B.size(1),
-        B.size(2),
+        A.size(1) if use_mxfp4_w4a16 else B.size(2),
         EM,
         num_tokens,
         A.stride(0),
@@ -967,8 +1008,8 @@ def invoke_fused_moe_triton_kernel(
         else 0,
         B_bias.stride(0) if B_bias is not None else 0,
         B_bias.stride(1) if B_bias is not None else 0,
-        0 if block_shape is None else block_shape[0],
-        0 if block_shape is None else block_shape[1],
+        group_n,
+        group_k,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         compute_type=compute_type,
@@ -984,6 +1025,7 @@ def invoke_fused_moe_triton_kernel(
         USE_TMA_B=use_tma_b,
         USE_TMA_A=use_tma_a,
         C_IS_SORTED=C_is_sorted,
+        USE_MXFP4_W4A16=use_mxfp4_w4a16,
         **config,
     )
 
