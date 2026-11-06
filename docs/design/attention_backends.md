@@ -275,3 +275,16 @@ vllm serve /path/to/DeepSeek-V4.1-Flash-1017 \
     --max-num-batched-tokens 256 --max-num-seqs 2 --gpu-memory-utilization 0.8 \
     --safetensors-load-strategy lazy
 ```
+
+Set `--moe-backend humming` for MXFP4 routed experts or
+`--linear-backend humming` for the ordinary FP8 linears. You can set either
+flag independently or use both. On SM80 with `--dtype bfloat16`, Humming
+uses BF16 activations with the checkpoint's E2M1 expert weights and E4M3
+linear weights, respectively, and retains UE8M0 scales. Grouped `wo_a`
+continues to use BF16 batched matrix multiplication.
+
+For the MoE path, an explicit `--quantization-config '{"moe":{"activation":null}}'`
+also requests unquantized activations. An explicit quantized activation request
+must be compatible with Humming and the GPU. `VLLM_HUMMING_INPUT_QUANT_CONFIG`,
+when set, takes precedence for Humming MoE. Humming requires NVCC or NVRTC
+for JIT compilation.
