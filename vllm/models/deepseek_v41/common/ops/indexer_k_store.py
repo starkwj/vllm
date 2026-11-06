@@ -17,6 +17,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.fp8 import fp8_e4m3fn_to_uint8, needs_software_e4m3fn
 from vllm.utils.deep_gemm import mqa_logits_use_mx_scales
 from vllm.v1.attention.ops.common import pack_ue8m0_x4
 
@@ -114,6 +115,7 @@ def indexer_k_norm_rope_store(
         KV_BLOCK_STRIDE=k_cache.stride(0),
         FP8_MAX=448.0,
         USE_FP4=use_fp4_cache,
+        USE_SOFTWARE_FP8=not use_fp4_cache and needs_software_e4m3fn(k_pre.device),
         MX_SCALE=not use_fp4_cache and mqa_logits_use_mx_scales(),
         SHUFFLE=shuffle,
         BLOCK_TILE_SIZE=_BLOCK_TILE_SIZE,
@@ -143,6 +145,7 @@ def _indexer_k_norm_rope_quant_store_kernel(
     KV_BLOCK_STRIDE: tl.constexpr,
     FP8_MAX: tl.constexpr,
     USE_FP4: tl.constexpr,
+    USE_SOFTWARE_FP8: tl.constexpr,
     MX_SCALE: tl.constexpr,
     SHUFFLE: tl.constexpr,
     BLOCK_TILE_SIZE: tl.constexpr,
@@ -247,8 +250,7 @@ def _indexer_k_norm_rope_quant_store_kernel(
         absmax = tl.maximum(tl.max(tl.abs(result_bf16), axis=0), 1e-4)
         exponent = tl.ceil(tl.log2(absmax * INV_FP8_MAX))
         inv_scale = tl.exp2(-exponent)
-        x_clamped = tl.clamp(result_bf16 * inv_scale, -FP8_MAX, FP8_MAX)
-        x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        x_uint8 = fp8_e4m3fn_to_uint8(result_bf16 * inv_scale, USE_SOFTWARE_FP8)
         if SHUFFLE:
             tiled = (
                 block // HEAD_TILE_SIZE * BLOCK_TILE_SIZE * HEAD_TILE_SIZE

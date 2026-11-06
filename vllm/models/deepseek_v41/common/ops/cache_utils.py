@@ -37,6 +37,11 @@ from vllm.models.deepseek_v4.common.ops.cache_utils import (
 from vllm.platforms import current_platform
 from vllm.transformers_utils.deepseek_v4_utils import get_compress_ratios
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.fp8 import (
+    fp8_e4m3fn_from_uint8,
+    fp8_e4m3fn_to_uint8,
+    needs_software_e4m3fn,
+)
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.math_utils import cdiv, next_power_of_2
 
@@ -73,6 +78,7 @@ def _quantize_and_insert_k_mxfp8_kernel(
     block_stride: tl.constexpr,  # total bytes per block (padded)
     fp8_max: tl.constexpr,
     use_fnuz: tl.constexpr = False,
+    use_software_fp8: tl.constexpr = False,
 ):
     """Quantize a bf16 K row to MXFP8 and insert it into a V4.1 paged cache.
 
@@ -103,16 +109,13 @@ def _quantize_and_insert_k_mxfp8_kernel(
     # a finite scale.
     amax = tl.maximum(tl.max(tl.abs(tiles), 1), 1e-4)
     exponent = tl.ceil(tl.log2(amax * (1.0 / fp8_max)))
-    scaled = tl.clamp(
-        tiles * tl.reshape(tl.exp2(-exponent), (scale_dim, 1)), -fp8_max, fp8_max
-    )
-    if use_fnuz:  # noqa: SIM108
-        fp8 = scaled.to(tl.float8e4b8)
+    scaled = tiles * tl.reshape(tl.exp2(-exponent), (scale_dim, 1))
+    if use_fnuz:
+        fp8 = tl.clamp(scaled, -fp8_max, fp8_max).to(tl.float8e4b8)
+        packed = fp8.to(tl.uint8, bitcast=True)
     else:
-        fp8 = scaled.to(tl.float8e4nv)
-    tl.store(
-        token_data_ptr + d, tl.reshape(fp8.to(tl.uint8, bitcast=True), (head_dim,))
-    )
+        packed = fp8_e4m3fn_to_uint8(scaled, use_software_fp8)
+    tl.store(token_data_ptr + d, tl.reshape(packed, (head_dim,)))
 
     # UE8M0 encoding: stored_value = exponent + 127 (bias).
     encoded = tl.minimum(tl.maximum(exponent + 127.0, 0.0), 255.0)
@@ -165,6 +168,7 @@ def quantize_and_insert_k_cache(
             if use_fnuz
             else torch.finfo(torch.float8_e4m3fn).max,
             use_fnuz=use_fnuz,
+            use_software_fp8=needs_software_e4m3fn(k.device),
         )
         return
 
@@ -198,6 +202,7 @@ def quantize_and_insert_k_cache(
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_fnuz=use_fnuz,
+        use_software_fp8=needs_software_e4m3fn(k.device),
     )
 
 
@@ -224,6 +229,7 @@ def _dequantize_and_gather_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
     use_fnuz: tl.constexpr = False,
+    use_software_fp8: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -281,14 +287,10 @@ def _dequantize_and_gather_k_kernel(
                 # Load quantized fp8 values (stored as uint8)
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
-                # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
                 if use_fnuz:
-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                    x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
                 else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                    x_float = fp8_e4m3fn_from_uint8(x_uint8, use_software_fp8)
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -338,6 +340,7 @@ def _dequantize_and_gather_k_one_pass_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks; the per-block form only
     use_fnuz: tl.constexpr = False,
+    use_software_fp8: tl.constexpr = False,
 ):
     """``_dequantize_and_gather_k_kernel`` with the token read in one tile.
 
@@ -382,13 +385,13 @@ def _dequantize_and_gather_k_one_pass_kernel(
         fp8_offsets = tl.arange(0, tile_dim)
         x_uint8 = tl.load(token_fp8_ptr + fp8_offsets)
         if use_fnuz:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+            x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
         else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_float = fp8_e4m3fn_from_uint8(x_uint8, use_software_fp8)
 
         encoded_scale = tl.load(token_scale_ptr + tl.arange(0, scale_dim))
         scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)  # UE8M0
-        tiles = tl.reshape(x_fp8.to(tl.float32), (scale_dim, quant_block))
+        tiles = tl.reshape(x_float, (scale_dim, quant_block))
         x_dequant = tl.reshape(tiles * tl.reshape(scale, (scale_dim, 1)), (tile_dim,))
         tl.store(
             output_row_ptr + fp8_offsets,
@@ -421,6 +424,7 @@ def _dequantize_and_gather_k_mxfp8_kernel(
     cache_block_size: tl.constexpr,
     block_stride: tl.constexpr,
     use_fnuz: tl.constexpr = False,
+    use_software_fp8: tl.constexpr = False,
 ):
     """Gather V4.1 MXFP8 rows into a bf16 workspace, dequantizing in place."""
     batch_idx = tl.program_id(0)
@@ -451,10 +455,10 @@ def _dequantize_and_gather_k_mxfp8_kernel(
 
         x_uint8 = tl.load(token_data_ptr + d)
         if use_fnuz:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+            x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
         else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        tiles = tl.reshape(x_fp8.to(tl.float32), (scale_dim, quant_block))
+            x_float = fp8_e4m3fn_from_uint8(x_uint8, use_software_fp8)
+        tiles = tl.reshape(x_float, (scale_dim, quant_block))
 
         # UE8M0: scale = 2^(stored_value - 127).
         encoded = tl.load(token_scale_ptr + s)
@@ -626,6 +630,7 @@ def dequantize_and_gather_k_cache_triton(
             cache_block_size=block_size,
             block_stride=k_cache.stride(0),
             use_fnuz=use_fnuz,
+            use_software_fp8=needs_software_e4m3fn(k_cache.device),
         )
         return
 
@@ -663,6 +668,7 @@ def dequantize_and_gather_k_cache_triton(
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
         use_fnuz=use_fnuz,
+        use_software_fp8=needs_software_e4m3fn(k_cache.device),
     )
 
 
@@ -685,15 +691,18 @@ def dequantize_and_gather_k_cache(
     """Dequantize and gather a paged DSv4 K cache.
 
     The record is read off ``k_cache.shape[-1]``; see the module header. Only
-    the fp8 records have a CuteDSL gather, so NVFP4 always takes the Triton
-    path.
+    the fp8 records have a CuteDSL gather. NVFP4 and pre-SM89 CUDA use Triton.
 
     ``use_fnuz`` MUST match the encoder of the specific cache being read:
     ``False`` for ``compressed_k_cache`` (Triton encoder is OCP everywhere),
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl() and k_cache.shape[-1] != V41_NVFP4_BYTES_PER_TOKEN:
+    if (
+        has_cutedsl()
+        and k_cache.shape[-1] != V41_NVFP4_BYTES_PER_TOKEN
+        and not needs_software_e4m3fn(k_cache.device)
+    ):
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL,
