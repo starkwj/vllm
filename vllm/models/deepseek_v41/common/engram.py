@@ -330,7 +330,10 @@ def _hash_ids_kernel(
     token = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     layer = tl.program_id(1)
     num_layers = tl.num_programs(1)
-    valid = token < num_tokens
+    in_bounds = token < num_tokens
+    valid = in_bounds & (
+        token < tl.load(query_start_loc + num_query_rows * query_stride)
+    )
     # Upper bound in query_start_loc[1:], including repeated padding boundaries.
     lo = tl.full((BLOCK_T,), 0, tl.int32)
     hi = tl.full((BLOCK_T,), num_query_rows, tl.int32)
@@ -421,7 +424,11 @@ def _hash_ids_kernel(
             out_offset = (token.to(tl.int64) * num_layers + layer)[:, None] * (
                 (MAX_NGRAM - 1) * num_heads
             ) + col[None, :]
-            tl.store(output + out_offset, hashed, valid[:, None] & (head < num_heads))
+            tl.store(
+                output + out_offset,
+                tl.where(valid[:, None], hashed, dead_id),
+                in_bounds[:, None] & (head < num_heads),
+            )
 
 
 class NgramHashState(nn.Module):

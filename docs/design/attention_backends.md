@@ -247,11 +247,16 @@ default on NVIDIA is `FLASHINFER_MLA_SPARSE_DSV4` on SM12x and
 DeepSeek V4.1 selects `TRITON_MLA_SPARSE_DSV41` by default on NVIDIA SM80
 (A100/A800). To select it explicitly, pass
 `--attention-config '{"backend":"TRITON_MLA_SPARSE_DSV41"}'`.
-Use `--enforce-eager --language-model-only`, BF16 activations, and the packed
+Use `--language-model-only`, BF16 activations, and the packed
 FP8 KV cache (`--kv-cache-dtype auto` or `fp8`). The compressed cache uses
 128-token blocks, with 64 stored rows for layers with a compression ratio of 2.
 
 The backend supports text attention with mixed chunked prefill and decode.
+Use `--enforce-eager` for eager execution. With the V2 model runner, pass
+`--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'` and
+`--no-swa-bounded-replay` to capture single-token decode. This mode requires
+DP and PP sizes of one and disables ubatching. Prefill runs eagerly.
+
 The indexer uses FP8 keys and FP32 logits, including when it masks logits
 to the selected candidate blocks. Its top-k options are `auto` (per row),
 `per_row`, and `torch`. Speculative decoding, context parallelism,

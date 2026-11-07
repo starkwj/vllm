@@ -484,10 +484,20 @@ def test_mixed_sparse_mla_uses_request_local_candidates(
 
 
 @pytest.mark.skipif(not has_tilelang(), reason="DeepSeek V4.1 uses TileLang mHC")
-def test_sm80_llm_eager_chunked_prefill(model_path):
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "decode_graph"])
+def test_sm80_llm_chunked_prefill_and_decode(model_path, enforce_eager, monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    graph_config = {
+        "compilation_config": {
+            "mode": 0,
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "decode_cudagraph_capture_request_sizes": [1, 2, 4],
+        },
+        "swa_bounded_replay": False,
+    }
     llm = LLM(
         model=model_path,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         language_model_only=True,
         skip_tokenizer_init=True,
         load_format="dummy",
@@ -497,6 +507,7 @@ def test_sm80_llm_eager_chunked_prefill(model_path):
         block_size=BLOCK_SIZE,
         kv_cache_memory_bytes=256 << 20,
         attention_config={"backend": "TRITON_MLA_SPARSE_DSV41"},
+        **({} if enforce_eager else graph_config),
     )
     lengths = [7, 180, 523]
     prompts = [

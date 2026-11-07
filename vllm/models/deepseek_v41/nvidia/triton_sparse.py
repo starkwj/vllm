@@ -6,6 +6,7 @@ from typing import ClassVar, cast
 import torch
 
 from vllm.config import VllmConfig
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
@@ -33,7 +34,9 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 
 
 class DeepseekV41TritonSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
 
 
 class DeepseekV41TritonSparseMLABackend(DeepseekV4SparseMLABackend):
@@ -51,7 +54,9 @@ class DeepseekV41TritonSparseMLABackend(DeepseekV4SparseMLABackend):
 
 
 class DeepseekV41TritonSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
     use_flashmla_tile_scheduler = False
 
 
@@ -77,7 +82,26 @@ class DeepseekV41TritonSparseMLAAttention(DeepseekV4Attention):
         attention = vllm_config.attention_config
         name = DeepseekV41TritonSparseMLABackend.get_name()
         if not model.enforce_eager:
-            raise ValueError(f"{name} requires --enforce-eager.")
+            compilation = vllm_config.compilation_config
+            if (
+                not vllm_config.use_v2_model_runner
+                or compilation.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
+                or compilation.mode != CompilationMode.NONE
+            ):
+                raise ValueError(
+                    f"{name} requires --enforce-eager or V2 with "
+                    "FULL_DECODE_ONLY CUDA graphs and compilation mode NONE."
+                )
+            if (
+                parallel.data_parallel_size != 1
+                or parallel.pipeline_parallel_size != 1
+                or parallel.use_ubatching
+                or vllm_config.cache_config.swa_bounded_replay
+            ):
+                raise ValueError(
+                    f"{name} decode CUDA graphs require DP=PP=1, no ubatching, "
+                    "and --no-swa-bounded-replay."
+                )
         if model.dtype != torch.bfloat16:
             raise ValueError(f"{name} requires bfloat16 activations.")
         if (

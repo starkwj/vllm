@@ -786,7 +786,7 @@ def _compute_global_topk_indices_and_lens_kernel(
 ):
     token_idx = tl.program_id(0)
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
-    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx, is_valid_token, other=0)
 
     count = tl.zeros((), dtype=tl.int32)
     for i in range(0, topk, TRITON_BLOCK_SIZE):
@@ -798,12 +798,13 @@ def _compute_global_topk_indices_and_lens_kernel(
             mask=mask,
             other=-1,
         )
-        is_valid = local_idx >= 0
+        is_valid = is_valid_token & (local_idx >= 0)
 
         block_indices = local_idx // block_size
         block_numbers = tl.load(
             block_table_ptr + req_idx * block_table_stride + block_indices,
             mask=mask & is_valid,
+            other=0,
         )
         block_offsets = local_idx % block_size
 
@@ -816,8 +817,7 @@ def _compute_global_topk_indices_and_lens_kernel(
         )
         count += tl.sum(is_valid.to(tl.int32), axis=0)
 
-    # Zero out length for padding tokens.
-    tl.store(topk_lens_ptr + token_idx, tl.where(is_valid_token, count, 0))
+    tl.store(topk_lens_ptr + token_idx, count)
 
 
 # FlashMLA sparse prefill asserts `params.topk % B_TOPK == 0` (see
