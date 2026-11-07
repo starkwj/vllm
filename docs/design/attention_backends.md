@@ -247,11 +247,12 @@ default on NVIDIA is `FLASHINFER_MLA_SPARSE_DSV4` on SM12x and
 DeepSeek V4.1 selects `TRITON_MLA_SPARSE_DSV41` by default on NVIDIA SM80
 (A100/A800). To select it explicitly, pass
 `--attention-config '{"backend":"TRITON_MLA_SPARSE_DSV41"}'`.
-Use `--language-model-only`, BF16 activations, and the packed
+Use BF16 activations and the packed
 FP8 KV cache (`--kv-cache-dtype auto` or `fp8`). The compressed cache uses
 128-token blocks, with 64 stored rows for layers with a compression ratio of 2.
 
-The backend supports text attention with mixed chunked prefill and decode.
+The backend supports text and image inputs with mixed chunked prefill and decode.
+For text-only serving, pass `--language-model-only` to skip the vision tower.
 Use `--enforce-eager` for eager execution. With the V2 model runner, pass
 `--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'` and
 `--no-swa-bounded-replay` to capture single-token decode. This mode requires
@@ -270,7 +271,15 @@ built-in DSpark drafter with the V2 runner in eager or either CUDA Graph
 mode. The graph modes capture uniform target verification batches and the draft
 step. Pass
 `--speculative-config '{"method":"dspark","num_speculative_tokens":5,"enable_adaptive_verification":false}'`.
-Context parallelism, LoRA, and image inputs are unsupported. Checkpoint loading
+Image inputs use the checkpoint's existing ViT and aligner, with causal SWA
+for image spans. On A100, `--mm-encoder-attn-backend TRITON_ATTN` selects the
+vision attention backend. Omit `--language-model-only` and set
+`--limit-mm-per-prompt '{"image":2}'` for up to two images per prompt.
+The vision encoder runs eagerly; the language model can use eager,
+`FULL_AND_PIECEWISE`, or `FULL_AND_PIECEWISE` with DSpark5 as above.
+Encoder CUDA graphs have not been validated on this backend.
+
+Context parallelism and LoRA are unsupported. Checkpoint loading
 and MoE kernel support depend on the model's weight format and are separate
 from this backend.
 

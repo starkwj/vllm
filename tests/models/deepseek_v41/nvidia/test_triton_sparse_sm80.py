@@ -3,9 +3,14 @@
 
 import json
 import math
+from pathlib import Path
 
 import pytest
 import torch
+from PIL import Image
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import TokenizersBackend
 
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm import LLM, SamplingParams
@@ -19,6 +24,10 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.kernels.attention.dsa.triton_mqa_logits import paged_mqa_logits
 from vllm.models.deepseek_v4.common.ops import fused_indexer_q_rope_quant
+from vllm.models.deepseek_v41.common.mm_preprocess import (
+    IMAGE_PLACEHOLDER,
+    IMAGE_SENTINEL_BASE_ID,
+)
 from vllm.models.deepseek_v41.common.ops.cache_utils import (
     V4_BYTES_PER_TOKEN,
     dequantize_and_gather_k_cache_triton,
@@ -114,6 +123,34 @@ def _engine_args(model_path, **kwargs):
         max_num_seqs=4,
         **kwargs,
     )
+
+
+@pytest.fixture
+def vision_model_path(model_path, tmp_path):
+    path = tmp_path / "synthetic-vision-model"
+    path.mkdir()
+    config = json.loads((Path(model_path) / "config.json").read_text())
+    vocab_size = IMAGE_SENTINEL_BASE_ID + 16
+    config["text_config"]["vocab_size"] = vocab_size
+    config["image_token_id"] = IMAGE_SENTINEL_BASE_ID
+    config["vision_config"] = {
+        "num_hidden_layers": 1,
+        "hidden_size": 128,
+        "num_attention_heads": 4,
+        "intermediate_size": 256,
+        "max_image_tokens": 8,
+        "min_pixels": 1764,
+    }
+    (path / "config.json").write_text(json.dumps(config))
+    vocab = {f"token{i}": i for i in range(vocab_size)}
+    del vocab[f"token{IMAGE_SENTINEL_BASE_ID}"]
+    vocab[IMAGE_PLACEHOLDER] = IMAGE_SENTINEL_BASE_ID
+    tokenizer = TokenizersBackend(
+        tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="token0")),
+        unk_token="token0",
+    )
+    tokenizer.save_pretrained(path)
+    return str(path)
 
 
 @pytest.mark.parametrize("explicit", [False, True])
@@ -634,3 +671,44 @@ def test_sm80_llm_chunked_prefill_and_decode(model_path, graph_mode, monkeypatch
         assert len(completion.token_ids) == 4
         assert completion.cumulative_logprob is not None
         assert math.isfinite(completion.cumulative_logprob)
+
+
+@pytest.mark.skipif(not has_tilelang(), reason="DeepSeek V4.1 uses TileLang mHC")
+def test_sm80_llm_images_use_piecewise_prefill(vision_model_path, monkeypatch):
+    """Image spans reach the encoder and target without losing raw token IDs."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    llm = LLM(
+        model=vision_model_path,
+        load_format="dummy",
+        dtype="bfloat16",
+        max_model_len=256,
+        max_num_batched_tokens=128,
+        max_num_seqs=2,
+        block_size=BLOCK_SIZE,
+        kv_cache_memory_bytes=256 << 20,
+        limit_mm_per_prompt={"image": 2},
+        mm_encoder_attn_backend="TRITON_ATTN",
+        swa_bounded_replay=False,
+        compilation_config={
+            "mode": 0,
+            "cudagraph_mode": "FULL_AND_PIECEWISE",
+            "prefill_cudagraph_capture_token_sizes": [32, 128],
+            "decode_cudagraph_capture_request_sizes": [1, 2],
+        },
+    )
+    image = Image.new("RGB", (42, 42), "red")
+    prompts = [
+        {
+            "prompt_token_ids": [7, *([IMAGE_SENTINEL_BASE_ID] * count), 11],
+            "multi_modal_data": {"image": [image] * count},
+        }
+        for count in (1, 2)
+    ]
+    params = SamplingParams(
+        temperature=0, max_tokens=4, ignore_eos=True, detokenize=False, logprobs=1
+    )
+    for output, count in zip(llm.generate(prompts, params, use_tqdm=False), (1, 2)):
+        assert output.prompt_token_ids.count(IMAGE_SENTINEL_BASE_ID) == 4 * count
+        assert len(output.outputs[0].token_ids) == 4
+        assert math.isfinite(output.outputs[0].cumulative_logprob)

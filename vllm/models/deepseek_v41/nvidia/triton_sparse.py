@@ -135,9 +135,6 @@ class DeepseekV41TritonSparseMLAAttention(DeepseekV4Attention):
             raise ValueError(f"{name} requires causal attention.")
         if vllm_config.lora_config is not None:
             raise ValueError(f"{name} does not support LoRA.")
-        multimodal = model.multimodal_config
-        if multimodal is not None and multimodal.get_limit_per_prompt("image") > 0:
-            raise ValueError(f"{name} requires --language-model-only for text serving.")
         if not DeepseekV41TritonSparseMLABackend.supports_kv_cache_dtype(
             vllm_config.cache_config.cache_dtype
         ):
@@ -201,8 +198,6 @@ class DeepseekV41TritonSparseMLAAttention(DeepseekV4Attention):
             return
         assert isinstance(metadata, dict)
         swa = cast(DeepseekSparseSWAMetadata, metadata[self.swa_cache_layer.prefix])
-        if swa.prefill_right_visible is not None:
-            raise NotImplementedError("TRITON_MLA_SPARSE_DSV41 supports text inputs.")
         num_tokens = swa.num_decode_tokens + swa.num_prefill_tokens
         if num_tokens == 0:
             output.zero_()
