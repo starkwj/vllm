@@ -107,11 +107,9 @@ class DeepseekV41TritonSparseMLAAttention(DeepseekV4Attention):
                 parallel.data_parallel_size != 1
                 or parallel.pipeline_parallel_size != 1
                 or parallel.use_ubatching
-                or vllm_config.cache_config.swa_bounded_replay
             ):
                 raise ValueError(
-                    f"{name} decode CUDA graphs require DP=PP=1, no ubatching, "
-                    "and --no-swa-bounded-replay."
+                    f"{name} decode CUDA graphs require DP=PP=1 and no ubatching."
                 )
         if model.dtype != torch.bfloat16:
             raise ValueError(f"{name} requires bfloat16 activations.")
