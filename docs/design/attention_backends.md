@@ -254,15 +254,20 @@ FP8 KV cache (`--kv-cache-dtype auto` or `fp8`). The compressed cache uses
 The backend supports text and image inputs with mixed chunked prefill and decode.
 For text-only serving, pass `--language-model-only` to skip the vision tower.
 Use `--enforce-eager` for eager execution. With the V2 model runner, pass
-`--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'` and
-`--no-swa-bounded-replay` to capture single-token decode. This mode requires
+`--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'`
+to capture single-token decode. This mode requires
 DP and PP sizes of one, with ubatching disabled. Prefill runs eagerly.
 For full decode graphs and piecewise prefill graphs, set
 `VLLM_USE_BREAKABLE_CUDAGRAPH=1` and pass
 `--compilation-config '{"mode":0,"cudagraph_mode":"FULL_AND_PIECEWISE"}'`
 instead. This uses runtime capture breaks around sparse attention and Engram
-host lookups; it does not use `torch.compile`. Keep SWA bounded replay disabled
-in either graph mode.
+host lookups; it does not use `torch.compile`.
+
+With V2, `--enable-prefix-caching --swa-bounded-replay` keeps compressed KV
+cached across requests and rebuilds the sliding-window KV from the hit's last
+window. The runner masks writes to the cached groups during this replay and
+restores Engram lookback from the request's token history. This also works with
+image inputs and fixed DSpark5 under `FULL_AND_PIECEWISE`.
 
 The indexer uses FP8 keys and FP32 logits, including when it masks logits
 to the selected candidate blocks. Its top-k options are `auto` (per row),

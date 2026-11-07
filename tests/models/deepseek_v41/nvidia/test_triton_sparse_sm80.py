@@ -615,9 +615,27 @@ def _graph_execution_state(worker):
     )
 
 
+def _prefix_replay_tokens(worker):
+    return max(
+        group.kv_cache_spec.prefix_replay_tokens
+        for group in worker.model_runner.kv_cache_config.kv_cache_groups
+    )
+
+
 @pytest.mark.skipif(not has_tilelang(), reason="DeepSeek V4.1 uses TileLang mHC")
-@pytest.mark.parametrize("graph_mode", [None, "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
-def test_sm80_llm_chunked_prefill_and_decode(model_path, graph_mode, monkeypatch):
+@pytest.mark.parametrize(
+    "graph_mode,bounded_replay",
+    [
+        (None, False),
+        ("FULL_DECODE_ONLY", False),
+        ("FULL_AND_PIECEWISE", False),
+        ("FULL_AND_PIECEWISE", True),
+    ],
+    ids=["eager", "decode_graph", "piecewise", "bounded_replay"],
+)
+def test_sm80_llm_chunked_prefill_and_decode(
+    model_path, graph_mode, bounded_replay, monkeypatch
+):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
@@ -629,7 +647,7 @@ def test_sm80_llm_chunked_prefill_and_decode(model_path, graph_mode, monkeypatch
             "cudagraph_capture_sizes": [1, 2, 4, 128],
             "decode_cudagraph_capture_request_sizes": [1, 2, 4],
         },
-        "swa_bounded_replay": False,
+        "swa_bounded_replay": bounded_replay,
     }
     llm = LLM(
         model=model_path,
@@ -671,6 +689,13 @@ def test_sm80_llm_chunked_prefill_and_decode(model_path, graph_mode, monkeypatch
         assert len(completion.token_ids) == 4
         assert completion.cumulative_logprob is not None
         assert math.isfinite(completion.cumulative_logprob)
+    if bounded_replay:
+        assert llm.collective_rpc(_prefix_replay_tokens) == [WINDOW]
+        warm = llm.generate(prompts[-1:], params, use_tqdm=False)[0]
+        assert warm.num_cached_tokens is not None
+        assert WINDOW < warm.num_cached_tokens < lengths[-1]
+        assert len(warm.outputs[0].token_ids) == 4
+        assert math.isfinite(warm.outputs[0].cumulative_logprob)
 
 
 @pytest.mark.skipif(not has_tilelang(), reason="DeepSeek V4.1 uses TileLang mHC")
