@@ -259,9 +259,12 @@ DP and PP sizes of one and disables ubatching. Prefill runs eagerly.
 
 The indexer uses FP8 keys and FP32 logits, including when it masks logits
 to the selected candidate blocks. Its top-k options are `auto` (per row),
-`per_row`, and `torch`. Speculative decoding, context parallelism,
-LoRA, and image inputs are unsupported. Checkpoint loading and MoE kernel
-support depend on the model's weight format and are separate from this backend.
+`per_row`, and `torch`. The official Flash-1017 checkpoint can use its
+built-in DSpark drafter with the V2 runner in eager mode. Pass
+`--speculative-config '{"method":"dspark","num_speculative_tokens":5,"enable_adaptive_verification":false}'`.
+Context parallelism, LoRA, and image inputs are unsupported. Checkpoint loading
+and MoE kernel support depend on the model's weight format and are separate
+from this backend.
 
 On eight A100s, the official DeepSeek-V4.1-Flash-1017 checkpoint can run
 directly with Marlin for the FP8 linears (W8A16) and MXFP4 routed experts

@@ -76,7 +76,9 @@ class DeepseekV41TritonSparseMLAAttention(DeepseekV4Attention):
         return DeepseekV41TritonIndexer
 
     @staticmethod
-    def validate_config(vllm_config: VllmConfig) -> None:
+    def validate_config(
+        vllm_config: VllmConfig, *, is_dspark_draft: bool = False
+    ) -> None:
         model = vllm_config.model_config
         parallel = vllm_config.parallel_config
         attention = vllm_config.attention_config
@@ -109,9 +111,19 @@ class DeepseekV41TritonSparseMLAAttention(DeepseekV4Attention):
             or parallel.decode_context_parallel_size > 1
         ):
             raise ValueError(f"{name} requires PCP and DCP sizes of 1.")
-        if vllm_config.speculative_config is not None:
-            raise ValueError(f"{name} does not support speculative decoding.")
-        if attention.use_non_causal:
+        spec = vllm_config.speculative_config
+        if spec is not None and (
+            not vllm_config.use_v2_model_runner
+            or not model.enforce_eager
+            or not spec.use_dspark()
+            or spec.num_speculative_tokens != 5
+            or spec.enable_adaptive_verification
+        ):
+            raise ValueError(
+                f"{name} speculative decoding requires V2 eager DSpark with five "
+                "draft tokens and adaptive verification disabled."
+            )
+        if attention.use_non_causal and not is_dspark_draft:
             raise ValueError(f"{name} requires causal attention.")
         if vllm_config.lora_config is not None:
             raise ValueError(f"{name} does not support LoRA.")

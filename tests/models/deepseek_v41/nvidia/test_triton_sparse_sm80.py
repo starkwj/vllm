@@ -26,9 +26,13 @@ from vllm.models.deepseek_v41.common.ops.cache_utils import (
 )
 from vllm.models.deepseek_v41.nvidia.model import _select_dsv4_attn_cls
 from vllm.models.deepseek_v41.nvidia.ops.sparse_mla_sm80 import sparse_mla_sm80
+from vllm.models.deepseek_v41.nvidia.triton_sparse import (
+    DeepseekV41TritonSWAMetadataBuilder,
+)
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
 
 pytestmark = pytest.mark.skipif(
     not (current_platform.is_cuda() and current_platform.is_device_capability(80)),
@@ -41,6 +45,11 @@ TOPK = 19
 CANDIDATE_BLOCK_SIZE = 8
 CANDIDATES = 2
 HEADS = 24
+DSPARK_CONFIG = {
+    "method": "dspark",
+    "num_speculative_tokens": 5,
+    "enable_adaptive_verification": False,
+}
 
 
 @pytest.fixture
@@ -268,25 +277,90 @@ def _logical_topk(logits):
     return indices.masked_fill(scores == -torch.inf, -1)
 
 
+@torch.inference_mode()
+def test_sm80_dspark_draft_sees_future_block_tokens(model_path, monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = _engine_args(
+        model_path, enforce_eager=True, speculative_config=DSPARK_CONFIG
+    ).create_engine_config()
+    device = torch.device("cuda")
+    page_size = 32
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[133, 6], query_lens=[5, 5]),
+        page_size,
+        device,
+        arange_block_indices=True,
+    ).replace(causal=False)
+    kv_spec = SlidingWindowMLASpec(
+        block_size=page_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=WINDOW,
+    )
+    meta = DeepseekV41TritonSWAMetadataBuilder(
+        kv_spec, ["draft.swa"], config, device
+    ).build(0, common)
+    table = common.block_table_tensor
+    cache = _paged_cache(table.numel(), page_size, V4_BYTES_PER_TOKEN, device)
+    values = torch.zeros(
+        (table.numel() * page_size, 512), device=device, dtype=torch.bfloat16
+    )
+    values[table[0, -1] * page_size + 4] = 1
+    values[table[1, 0] * page_size + 5] = 2
+    quantize_and_insert_k_cache(
+        values, cache.flatten(1), torch.arange(len(values), device=device), page_size
+    )
+    q = torch.zeros((10, 8, 512), device=device, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    assert meta.decode_swa_indices is not None and meta.decode_swa_lens is not None
+    sparse_mla_sm80(
+        q,
+        out,
+        torch.full((8,), -torch.inf, device=device),
+        torch.arange(len(q), device=device),
+        cache,
+        meta.decode_swa_indices.squeeze(1),
+        meta.decode_swa_lens,
+        512**-0.5,
+        is_decode=True,
+    )
+    expected = torch.cat(
+        (torch.full_like(out[:5], 1 / 133), torch.full_like(out[5:], 2 / 6))
+    )
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
-    ("ratio", "topk_backend"), [(1, "auto"), (2, "per_row"), (1, "torch")]
+    ("ratio", "topk_backend", "verify"),
+    [
+        (1, "auto", False),
+        (2, "per_row", False),
+        (1, "torch", False),
+        (1, "auto", True),
+        (2, "per_row", True),
+    ],
 )
 @torch.inference_mode()
 def test_mixed_sparse_mla_uses_request_local_candidates(
-    model_path, tmp_path, monkeypatch, ratio, topk_backend
+    model_path, tmp_path, monkeypatch, ratio, topk_backend, verify
 ):
     # Force a prefill request to span two indexer chunks (ratio 1) and mix
     # requests with different causal boundaries and physical page numbers.
     monkeypatch.setenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "1")
+    if verify:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     config = _engine_args(
         model_path,
         enforce_eager=True,
         attention_config={"backend": "TRITON_MLA_SPARSE_DSV41"},
         kernel_config={"sparse_indexer_topk_backend": topk_backend},
+        speculative_config=DSPARK_CONFIG if verify else None,
     ).create_engine_config()
     device = torch.device("cuda:0")
     torch.manual_seed(71)
-    spec = BatchSpec(seq_lens=[1, 267, 913, 161], query_lens=[1, 1, 290, 5])
+    query_lens = [1, 6, 290, 7] if verify else [1, 1, 290, 5]
+    spec = BatchSpec(seq_lens=[1, 267, 913, 161], query_lens=query_lens)
     common = create_common_attn_metadata(
         spec, BLOCK_SIZE, device, arange_block_indices=True
     )
@@ -358,6 +432,7 @@ def test_mixed_sparse_mla_uses_request_local_candidates(
             if ratio == 1:
                 assert len(index_meta.prefill.chunks) >= 2
             assert (index_meta.num_decodes, index_meta.num_prefills) == (2, 2)
+            assert index_meta.num_decode_tokens == sum(query_lens[:2])
 
             swa_layer = layer.swa_cache_layer
             swa_meta = (
