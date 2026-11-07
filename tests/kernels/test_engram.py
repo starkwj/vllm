@@ -531,6 +531,7 @@ def test_engram_hash_replay(query_len, capture, strided_positions, large_hashes)
             offsets,
         )
         torch.testing.assert_close(output[:real].cpu(), expected, rtol=0, atol=0)
+        assert torch.all(output[starts[-1] :] == engram_ops.DEAD_ID)
 
     empty_output = state(
         input_ids[:0], positions[:0], args[2], dead_mask[:0], *args[4:]

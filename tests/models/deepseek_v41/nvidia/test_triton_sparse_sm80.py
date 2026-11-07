@@ -119,8 +119,10 @@ def test_triton_backend_selects_sm80_eager(model_path, explicit):
     assert _select_dsv4_attn_cls(config).backend_cls is backend
 
 
-def test_triton_backend_requires_eager(model_path):
-    config = _engine_args(model_path, enforce_eager=False).create_engine_config()
+def test_triton_backend_rejects_missing_graph_mode(model_path):
+    config = _engine_args(
+        model_path, enforce_eager=False, compilation_config={"cudagraph_mode": "NONE"}
+    ).create_engine_config()
     with pytest.raises(ValueError, match="--enforce-eager"):
         _select_dsv4_attn_cls(config)
 
@@ -484,10 +486,19 @@ def test_mixed_sparse_mla_uses_request_local_candidates(
 
 
 @pytest.mark.skipif(not has_tilelang(), reason="DeepSeek V4.1 uses TileLang mHC")
-def test_sm80_llm_eager_chunked_prefill(model_path):
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "decode_graph"])
+def test_sm80_llm_chunked_prefill_and_decode(model_path, enforce_eager):
+    graph_config = {
+        "compilation_config": {
+            "mode": 0,
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "decode_cudagraph_capture_request_sizes": [1, 2, 4],
+        },
+        "swa_bounded_replay": False,
+    }
     llm = LLM(
         model=model_path,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         language_model_only=True,
         skip_tokenizer_init=True,
         load_format="dummy",
@@ -497,6 +508,7 @@ def test_sm80_llm_eager_chunked_prefill(model_path):
         block_size=BLOCK_SIZE,
         kv_cache_memory_bytes=256 << 20,
         attention_config={"backend": "TRITON_MLA_SPARSE_DSV41"},
+        **({} if enforce_eager else graph_config),
     )
     lengths = [7, 180, 523]
     prompts = [
