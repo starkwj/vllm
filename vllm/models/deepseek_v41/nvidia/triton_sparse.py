@@ -34,9 +34,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 
 
 class DeepseekV41TritonSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    )
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
 
 class DeepseekV41TritonSparseMLABackend(DeepseekV4SparseMLABackend):
@@ -54,9 +52,7 @@ class DeepseekV41TritonSparseMLABackend(DeepseekV4SparseMLABackend):
 
 
 class DeepseekV41TritonSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    )
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     use_flashmla_tile_scheduler = False
 
 
@@ -114,13 +110,12 @@ class DeepseekV41TritonSparseMLAAttention(DeepseekV4Attention):
         spec = vllm_config.speculative_config
         if spec is not None and (
             not vllm_config.use_v2_model_runner
-            or not model.enforce_eager
             or not spec.use_dspark()
             or spec.num_speculative_tokens != 5
             or spec.enable_adaptive_verification
         ):
             raise ValueError(
-                f"{name} speculative decoding requires V2 eager DSpark with five "
+                f"{name} speculative decoding requires V2 DSpark with five "
                 "draft tokens and adaptive verification disabled."
             )
         if attention.use_non_causal and not is_dspark_draft:
