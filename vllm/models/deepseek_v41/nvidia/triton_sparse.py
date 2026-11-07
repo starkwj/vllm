@@ -5,6 +5,7 @@ from typing import ClassVar, cast
 
 import torch
 
+from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.forward_context import get_forward_context
@@ -83,12 +84,24 @@ class DeepseekV41TritonSparseMLAAttention(DeepseekV4Attention):
             compilation = vllm_config.compilation_config
             if (
                 not vllm_config.use_v2_model_runner
-                or compilation.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY
+                or compilation.cudagraph_mode not in (
+                    CUDAGraphMode.FULL_DECODE_ONLY,
+                    CUDAGraphMode.FULL_AND_PIECEWISE,
+                )
                 or compilation.mode != CompilationMode.NONE
             ):
                 raise ValueError(
                     f"{name} requires --enforce-eager or V2 with "
-                    "FULL_DECODE_ONLY CUDA graphs and compilation mode NONE."
+                    "FULL_DECODE_ONLY or FULL_AND_PIECEWISE CUDA graphs and "
+                    "compilation mode NONE."
+                )
+            if (
+                compilation.cudagraph_mode.has_piecewise_cudagraphs()
+                and not is_breakable_cudagraph_enabled(compilation)
+            ):
+                raise ValueError(
+                    f"{name} FULL_AND_PIECEWISE requires breakable CUDA graphs "
+                    "(VLLM_USE_BREAKABLE_CUDAGRAPH=1)."
                 )
             if (
                 parallel.data_parallel_size != 1

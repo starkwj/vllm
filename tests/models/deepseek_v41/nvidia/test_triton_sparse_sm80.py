@@ -128,9 +128,18 @@ def test_triton_backend_selects_sm80_eager(model_path, explicit):
     assert _select_dsv4_attn_cls(config).backend_cls is backend
 
 
-def test_triton_backend_requires_eager(model_path):
-    config = _engine_args(model_path, enforce_eager=False).create_engine_config()
-    with pytest.raises(ValueError, match="--enforce-eager"):
+def test_triton_backend_graphs_require_v2(model_path, monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    config = _engine_args(
+        model_path,
+        enforce_eager=False,
+        swa_bounded_replay=False,
+        compilation_config={
+            "mode": 0,
+            "cudagraph_mode": "FULL_AND_PIECEWISE",
+        },
+    ).create_engine_config()
+    with pytest.raises(ValueError, match="requires --enforce-eager or V2"):
         _select_dsv4_attn_cls(config)
 
 
@@ -558,21 +567,36 @@ def test_mixed_sparse_mla_uses_request_local_candidates(
         cleanup_dist_env_and_memory()
 
 
+def _graph_execution_state(worker):
+    from vllm.compilation.counter import compilation_counter
+
+    compilation = worker.vllm_config.compilation_config
+    return (
+        compilation.mode.name,
+        compilation.cudagraph_mode.name,
+        compilation_counter.num_cudagraph_captured,
+    )
+
+
 @pytest.mark.skipif(not has_tilelang(), reason="DeepSeek V4.1 uses TileLang mHC")
-@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "decode_graph"])
-def test_sm80_llm_chunked_prefill_and_decode(model_path, enforce_eager, monkeypatch):
+@pytest.mark.parametrize("graph_mode", [None, "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE"])
+def test_sm80_llm_chunked_prefill_and_decode(model_path, graph_mode, monkeypatch):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     graph_config = {
         "compilation_config": {
             "mode": 0,
-            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_mode": graph_mode or "NONE",
+            "use_breakable_cudagraph": True,
+            "cudagraph_capture_sizes": [1, 2, 4, 128],
             "decode_cudagraph_capture_request_sizes": [1, 2, 4],
         },
         "swa_bounded_replay": False,
     }
     llm = LLM(
         model=model_path,
-        enforce_eager=enforce_eager,
+        enforce_eager=graph_mode is None,
         language_model_only=True,
         skip_tokenizer_init=True,
         load_format="dummy",
@@ -582,8 +606,15 @@ def test_sm80_llm_chunked_prefill_and_decode(model_path, enforce_eager, monkeypa
         block_size=BLOCK_SIZE,
         kv_cache_memory_bytes=256 << 20,
         attention_config={"backend": "TRITON_MLA_SPARSE_DSV41"},
-        **({} if enforce_eager else graph_config),
+        **graph_config,
     )
+    if graph_mode is not None:
+        for compile_mode, actual_graph_mode, captured in llm.collective_rpc(
+            _graph_execution_state
+        ):
+            assert compile_mode == "NONE"
+            assert actual_graph_mode == graph_mode
+            assert captured > 0
     lengths = [7, 180, 523]
     prompts = [
         {"prompt_token_ids": [1 + i % 200 for i in range(length)]} for length in lengths

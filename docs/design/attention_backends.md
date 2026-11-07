@@ -256,12 +256,18 @@ Use `--enforce-eager` for eager execution. With the V2 model runner, pass
 `--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'` and
 `--no-swa-bounded-replay` to capture single-token decode. This mode requires
 DP and PP sizes of one, with ubatching disabled. Prefill runs eagerly.
+For full decode graphs and piecewise prefill graphs, set
+`VLLM_USE_BREAKABLE_CUDAGRAPH=1` and pass
+`--compilation-config '{"mode":0,"cudagraph_mode":"FULL_AND_PIECEWISE"}'`
+instead. This uses runtime capture breaks around sparse attention and Engram
+host lookups; it does not use `torch.compile`. Keep SWA bounded replay disabled
+in either graph mode.
 
 The indexer uses FP8 keys and FP32 logits, including when it masks logits
 to the selected candidate blocks. Its top-k options are `auto` (per row),
 `per_row`, and `torch`. The official Flash-1017 checkpoint can use its
-built-in DSpark drafter with the V2 runner in eager or decode-only CUDA Graph
-mode. The graph mode captures uniform target verification batches and the draft
+built-in DSpark drafter with the V2 runner in eager or either CUDA Graph
+mode. The graph modes capture uniform target verification batches and the draft
 step. Pass
 `--speculative-config '{"method":"dspark","num_speculative_tokens":5,"enable_adaptive_verification":false}'`.
 Context parallelism, LoRA, and image inputs are unsupported. Checkpoint loading
