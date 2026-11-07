@@ -204,7 +204,9 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
         return MoEOutput(routed=routed, shared_output=shared_output)
 
 
-def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
+def _select_dsv4_attn_cls(
+    vllm_config: VllmConfig, *, is_dspark_draft: bool = False
+) -> type[DeepseekV4Attention]:
     """Pick the CUDA sparse-MLA attention class for the configured backend.
 
     The generic CUDA backend selector does not instantiate DSv4 layers directly,
@@ -227,7 +229,9 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
             raise ValueError(f"{triton_backend.name} requires an SM80 CUDA GPU.")
         if backend not in (None, triton_backend):
             raise ValueError(f"DeepSeek V4.1 on SM80 requires {triton_backend.name}.")
-        DeepseekV41TritonSparseMLAAttention.validate_config(vllm_config)
+        DeepseekV41TritonSparseMLAAttention.validate_config(
+            vllm_config, is_dspark_draft=is_dspark_draft
+        )
         return DeepseekV41TritonSparseMLAAttention
     if vllm_config.parallel_config.prefill_context_parallel_size > 1:
         if backend not in (
@@ -356,6 +360,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         run_gemm_rs: bool = False,
         mhc_stream: torch.cuda.Stream | None = None,
         fuse_mhc_all_reduce: bool = False,
+        is_dspark_draft: bool = False,
     ):
         super().__init__()
 
@@ -380,7 +385,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
 
         self.rms_norm_eps = config.rms_norm_eps
-        self.attn = _select_dsv4_attn_cls(vllm_config)(
+        attention_cls = _select_dsv4_attn_cls(
+            vllm_config, is_dspark_draft=is_dspark_draft
+        )
+        self.attn = attention_cls(
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,

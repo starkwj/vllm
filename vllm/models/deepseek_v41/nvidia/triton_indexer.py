@@ -15,6 +15,7 @@ from vllm.model_executor.layers.indexer_topk import get_indexer_topk
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.models.deepseek_v41.attention import DeepseekV4Indexer
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backend import max_decode_query_len
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
     dense_logits_rows,
@@ -26,14 +27,18 @@ class DeepseekV41TritonSparseAttnIndexer(SparseAttnIndexer):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        scheduler = get_current_vllm_config().scheduler_config
+        config = get_current_vllm_config()
+        scheduler = config.scheduler_config
         max_rows = scheduler.max_num_batched_tokens
         width = self.max_model_len
         prefill_budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024**2
         self.decode_budget = envs.VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB * 1024**2
         # A budget always admits at least one row, even at the maximum width.
         prefill_elements = min(max_rows * width, max(width, prefill_budget // 4))
-        decode_elements = min(max_rows, scheduler.max_num_seqs) * width
+        decode_rows = min(
+            max_rows, scheduler.max_num_seqs * max_decode_query_len(config)
+        )
+        decode_elements = decode_rows * width
         if self.decode_budget:
             decode_elements = min(decode_elements, max(width, self.decode_budget // 4))
         logits_elements = max(prefill_elements, decode_elements)
@@ -141,7 +146,9 @@ class DeepseekV41TritonSparseAttnIndexer(SparseAttnIndexer):
                     )
 
         if (decode := indexer.decode) is not None and num_decode:
-            assert num_decode == indexer.num_decodes and not decode.requires_padding
+            # SM80 expands DSpark verify metadata into one page-table row and
+            # one causal length per query. Padding rows carry a zero length.
+            assert decode.block_table.shape[0] == decode.seq_lens.numel() == num_decode
             width = indexer.max_seq_len // self.compress_ratio
             if width:
                 rows_per_call = (
