@@ -41,6 +41,7 @@ def _load_packed_kv(cache, slot, d, page_size: tl.constexpr, page_stride: tl.con
 def _sparse_mla(
     Q,
     Out,
+    Partials,
     Sink,
     Positions,
     SWACache,
@@ -63,6 +64,8 @@ def _sparse_mla(
     sm_scale: tl.constexpr,
     head_tile: tl.constexpr,
     key_tile: tl.constexpr,
+    num_splits: tl.constexpr,
+    partial_stride: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1) * head_tile + tl.arange(0, head_tile)
@@ -70,11 +73,15 @@ def _sparse_mla(
     q = tl.load(
         Q + row * q_row_stride + h[:, None] * 512 + d[None, :], h[:, None] < heads, 0
     )
-    sink = tl.load(Sink + h, h < heads, -float("inf"))
-    # Start with the sink's zero-valued KV. A finite initial maximum also
-    # handles empty rows and the optional -inf sink without inf-inf.
-    m = tl.where(sink == -float("inf"), -3.402823466e38, sink)
-    denom = tl.where(sink == -float("inf"), 0.0, 1.0)
+    # A finite initial maximum handles fully masked tiles without inf-inf.
+    neg_large: tl.constexpr = -3.402823466e38
+    if num_splits == 1:
+        sink = tl.load(Sink + h, h < heads, -float("inf"))
+        m = tl.where(sink == -float("inf"), neg_large, sink)
+        denom = tl.where(sink == -float("inf"), 0.0, 1.0)
+    else:
+        m = tl.full((head_tile,), neg_large, tl.float32)
+        denom = tl.zeros((head_tile,), tl.float32)
     acc = tl.full((head_tile, 512), 0, tl.float32)
 
     swa_len = tl.load(SWALens + row)
@@ -86,7 +93,14 @@ def _sparse_mla(
         compressed_width = tl.where(
             has_topk, tl.minimum(topk, (pos + 1) // compress_ratio), 0
         ).to(tl.int32)
-    for tile in range(swa_tiles + tl.cdiv(compressed_width, key_tile)):
+    num_tiles = swa_tiles + tl.cdiv(compressed_width, key_tile)
+    tile_start = 0
+    tile_end = num_tiles
+    if num_splits > 1:
+        split = tl.program_id(2)
+        tile_start = split * num_tiles // num_splits
+        tile_end = (split + 1) * num_tiles // num_splits
+    for tile in range(tile_start, tile_end):
         cols = tl.arange(0, key_tile)
         if compress_ratio == 0 or tile < swa_tiles:
             cols += tile * key_tile
@@ -114,11 +128,48 @@ def _sparse_mla(
         acc = tl.dot(p.to(tl.bfloat16), kv, acc * alpha[:, None])
         m = next_m
 
-    result = acc / tl.where(denom > 0, denom, 1.0)[:, None]
+    if num_splits == 1:
+        result = acc / tl.where(denom > 0, denom, 1.0)[:, None]
+        tl.store(
+            Out + row * out_row_stride + h[:, None] * 512 + d[None, :],
+            result,
+            h[:, None] < heads,
+        )
+    else:
+        partial = Partials + ((row * heads + h) * num_splits + split) * partial_stride
+        tl.store(partial[:, None] + d[None, :], acc, h[:, None] < heads)
+        tl.store(partial + 512, m, h < heads)
+        tl.store(partial + 513, denom, h < heads)
+
+
+@triton.jit
+def _merge_sparse_mla_splits(
+    Partials,
+    Sink,
+    Out,
+    out_row_stride: tl.constexpr,
+    heads: tl.constexpr,
+    num_splits: tl.constexpr,
+    partial_stride: tl.constexpr,
+    reduce_tile: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1)
+    d = tl.program_id(2) * reduce_tile + tl.arange(0, reduce_tile)
+    splits = tl.arange(0, num_splits)
+    partial = Partials + ((row * heads + h) * num_splits + splits) * partial_stride
+    m = tl.load(partial + 512)
+    denom = tl.load(partial + 513)
+    sink = tl.load(Sink + h)
+    # Merge the split states and add the zero-valued sink once.
+    maximum = tl.maximum(tl.max(m, 0), sink)
+    weights = tl.exp(m - maximum)
+    denom = tl.sum(weights * denom, 0) + tl.exp(sink - maximum)
+    acc = tl.load(partial[:, None] + d[None, :])
+    result = tl.sum(acc * weights[:, None], 0) / tl.where(denom > 0, denom, 1.0)
     tl.store(
-        Out + row * out_row_stride + h[:, None] * 512 + d[None, :],
+        Out + row * out_row_stride + h * 512 + d,
         result,
-        h[:, None] < heads,
     )
 
 
@@ -135,6 +186,8 @@ def sparse_mla_sm80(
     compressed_indices: torch.Tensor | None = None,
     compressed_lens: torch.Tensor | None = None,
     compress_ratio: int = 0,
+    *,
+    is_decode: bool = False,
 ) -> None:
     """Attend directly to paged SWA and selected compressed KV rows."""
     if not q.shape[0]:
@@ -149,9 +202,29 @@ def sparse_mla_sm80(
         assert compressed_cache.stride()[1:] == swa_cache.stride()[1:]
         assert compressed_indices is not None and compressed_lens is not None
     head_tile = 16
-    _sparse_mla[(q.shape[0], triton.cdiv(q.shape[1], head_tile))](
+    rows, heads, _ = q.shape
+    head_blocks = triton.cdiv(heads, head_tile)
+    num_splits, key_tile, num_stages = 1, 32, 3
+    # A small decode grid underfills SM80. Split the KV tiles without changing
+    # prefill or larger decode grids.
+    if is_decode and rows * head_blocks <= 8:
+        num_splits = 32 if compress_ratio else 8
+        key_tile, num_stages = 16, 1
+    # Two FP32 statistics follow each partial vector. Keep the vectors aligned.
+    partial_stride = 516
+    partials = (
+        torch.empty(
+            (rows, heads, num_splits, partial_stride),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        if num_splits > 1
+        else None
+    )
+    _sparse_mla[(rows, head_blocks, num_splits)](
         q,
         output,
+        partials,
         sink,
         positions,
         swa_cache,
@@ -170,9 +243,25 @@ def sparse_mla_sm80(
         compressed_indices.stride(0) if compressed_indices is not None else 0,
         compressed_indices.shape[1] if compressed_indices is not None else 0,
         compress_ratio,
-        q.shape[1],
+        heads,
         scale,
         head_tile,
-        32,
+        key_tile,
+        num_splits,
+        partial_stride,
         num_warps=4,
+        num_stages=num_stages,
     )
+    if partials is not None:
+        reduce_tile = 128
+        _merge_sparse_mla_splits[(rows, heads, 512 // reduce_tile)](
+            partials,
+            sink,
+            output,
+            output.stride(0),
+            heads,
+            num_splits,
+            partial_stride,
+            reduce_tile,
+            num_warps=4,
+        )

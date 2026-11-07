@@ -183,13 +183,15 @@ class DeepseekV41TritonSparseMLAAttention(DeepseekV4Attention):
                 swa.is_valid_token,
             )
 
-        for rows, indices, lens in (
+        for is_decode, rows, indices, lens in (
             (
+                True,
                 slice(0, swa.num_decode_tokens),
                 swa.decode_swa_indices,
                 swa.decode_swa_lens,
             ),
             (
+                False,
                 slice(swa.num_decode_tokens, num_tokens),
                 swa.prefill_swa_indices,
                 swa.prefill_swa_lens,
@@ -211,6 +213,7 @@ class DeepseekV41TritonSparseMLAAttention(DeepseekV4Attention):
                 compressed_indices[rows] if compressed_indices is not None else None,
                 compressed_lens[rows] if compressed_lens is not None else None,
                 self.compress_ratio,
+                is_decode=is_decode,
             )
         if self.padded_heads > self.n_local_heads:
             output[:num_tokens, self.n_local_heads :].zero_()
