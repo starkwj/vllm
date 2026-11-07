@@ -25,6 +25,7 @@ from vllm.models.deepseek_v41.common.ops.cache_utils import (
     quantize_and_insert_k_cache,
 )
 from vllm.models.deepseek_v41.nvidia.model import _select_dsv4_attn_cls
+from vllm.models.deepseek_v41.nvidia.ops.sparse_mla_sm80 import sparse_mla_sm80
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -215,6 +216,51 @@ def _attention_cache(table, page_size, lengths):
         gathered, cache, lengths, None, table.contiguous(), page_size, offset=0
     )
     return cache, gathered.float()
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@torch.inference_mode()
+def test_sm80_split_decode_preserves_masked_paged_attention(ratio):
+    torch.manual_seed(13)
+    device = torch.device("cuda")
+    rows, heads = 4, 8
+    swa_table = torch.tensor([[1, 0]], device=device, dtype=torch.int32)
+    comp_table = swa_table.new_tensor([[5, 1, 2, 0, 4, 3, 7, 6]])
+    swa_page, comp_page = BLOCK_SIZE, BLOCK_SIZE // ratio
+    swa_cache, _ = _attention_cache(swa_table, swa_page, swa_table.new_tensor([256]))
+    comp_cache, _ = _attention_cache(
+        comp_table, comp_page, comp_table.new_tensor([comp_page * 8])
+    )
+
+    positions = torch.tensor([0, 256, 1023, 1024], device=device)
+    swa_cols = torch.arange(WINDOW, device=device)
+    swa_slots = swa_table[0, (swa_cols + 73) // swa_page] * swa_page
+    swa_slots += (swa_cols + 73) % swa_page
+    swa_slots = swa_slots.int().repeat(rows, 1)
+    swa_slots[0] = -1
+    swa_slots[3, ::5] = -1
+    swa_lens = swa_slots.new_tensor([0, WINDOW, 17, WINDOW])
+
+    cols = torch.arange(512, device=device)
+    comp_slots = comp_table[0, cols // comp_page] * comp_page + cols % comp_page
+    comp_slots = comp_slots.int().repeat(rows, 1)
+    comp_slots.masked_fill_(cols >= (positions[:, None] + 1) // ratio, -1)
+    comp_slots[0] = -1
+    comp_slots[3, ::3] = -1
+    comp_lens = (comp_slots >= 0).sum(dim=1, dtype=torch.int32)
+
+    q = torch.randn(
+        (rows + 1, heads + 8, 512), dtype=torch.bfloat16, device=device
+    )[1:, :heads]
+    eager, split = torch.empty_like(q), torch.empty_like(q)
+    sink = torch.linspace(-2, 2, heads, device=device)
+    sink[0] = -torch.inf
+    args = (sink, positions, swa_cache, swa_slots, swa_lens, 512**-0.5)
+    cache = (comp_cache, comp_slots, comp_lens, ratio)
+    sparse_mla_sm80(q, eager, *args, *cache)
+    sparse_mla_sm80(q, split, *args, *cache, is_decode=True)
+    torch.testing.assert_close(split, eager, atol=0.003, rtol=0.01)
+    assert torch.count_nonzero(split[0]) == 0
 
 
 def _logical_topk(logits):
