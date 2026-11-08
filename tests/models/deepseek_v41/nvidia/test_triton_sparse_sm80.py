@@ -22,7 +22,13 @@ from vllm.distributed import (
 )
 from vllm.engine.arg_utils import EngineArgs
 from vllm.forward_context import set_forward_context
+from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+    apply_candidate_mask,
+    mask_invalid_topk,
+    select_candidate_blocks,
+)
 from vllm.model_executor.kernels.attention.dsa.triton_mqa_logits import paged_mqa_logits
+from vllm.model_executor.layers.indexer_topk import get_indexer_topk
 from vllm.models.deepseek_v4.common.ops import fused_indexer_q_rope_quant
 from vllm.models.deepseek_v41.common.mm_preprocess import (
     IMAGE_PLACEHOLDER,
@@ -226,8 +232,10 @@ def _indexer_cache(table, page_size, device):
 
 
 @pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize("width", [71, 8704, 32769])
+@pytest.mark.parametrize("mask_tail", [False, True])
 @torch.inference_mode()
-def test_sm80_paged_indexer_logits_match_reference(prefill):
+def test_sm80_paged_indexer_logits_match_reference(prefill, width, mask_tail):
     torch.manual_seed(19)
     device = torch.device("cuda")
     table = torch.tensor([[3, 0], [1, 2]], device=device, dtype=torch.int32)
@@ -236,23 +244,104 @@ def test_sm80_paged_indexer_logits_match_reference(prefill):
     lengths = torch.tensor([65, 0, 71], device=device, dtype=torch.int32)
     q = torch.randn((4, 32, 128), device=device).to(torch.float8_e4m3fn)[1:]
     w = torch.randn(q.shape[:2], device=device)
-    width = 71
     if prefill:
         starts = torch.tensor([71, 0, 0], device=device, dtype=torch.int32)
         key_to_request = torch.repeat_interleave(
             table.new_tensor([0, 1]), table.new_tensor([71, 65])
         )
         actual = paged_mqa_logits(
-            q, cache, w, table, lengths, width, starts, key_to_request
+            q,
+            cache,
+            w,
+            table,
+            lengths,
+            width,
+            starts,
+            key_to_request,
+            mask_tail=mask_tail,
         )
     else:
-        actual = paged_mqa_logits(q, cache, w, table[req], lengths, width)
-    dots = torch.einsum("thd,tkd->thk", q.float(), keys[req, :width]).relu()
-    expected = (dots * w[:, :, None]).sum(1) * scales[req, :width]
+        actual = paged_mqa_logits(
+            q, cache, w, table[req], lengths, width, mask_tail=mask_tail
+        )
+    covered_width = min(width, keys.shape[1])
+    dots = torch.einsum("thd,tkd->thk", q.float(), keys[req, :covered_width]).relu()
+    expected = torch.full_like(actual, -torch.inf)
+    expected[:, :covered_width] = (
+        (dots * w[:, :, None]).sum(1) * scales[req, :covered_width]
+    )
     expected.masked_fill_(
         torch.arange(width, device=device) >= lengths[:, None], -torch.inf
     )
+    if not mask_tail:
+        actual.masked_fill_(
+            torch.arange(width, device=device) >= lengths[:, None], -torch.inf
+        )
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=1e-5)
+
+
+@torch.inference_mode()
+def test_sm80_ragged_indexer_replay_ignores_stale_columns():
+    """Growing and shrinking graph rows never select poisoned, invisible logits."""
+    torch.manual_seed(31)
+    device = torch.device("cuda")
+    rows, width, candidate_count, topk_tokens = 6, 1048576, 2048, 512
+    table = torch.randperm(rows * 512, device=device).reshape(rows, 512).int()
+    cache, _, _ = _indexer_cache(table, 64, device)
+    q = torch.randn((rows, 32, 128), device=device).to(torch.float8_e4m3fn)
+    weights = torch.randn((rows, 32), device=device)
+    lengths = torch.full((rows,), 32767, device=device, dtype=torch.int32)
+    columns = torch.arange(width, device=device)
+
+    def run(ragged):
+        logits = paged_mqa_logits(
+            q, cache, weights, table, lengths, width, mask_tail=not ragged
+        )
+        if ragged:
+            logits.masked_fill_(columns >= lengths[:, None], torch.nan)
+        candidates = torch.empty(
+            (rows, candidate_count), device=device, dtype=torch.int32
+        )
+        select_candidate_blocks(
+            logits,
+            None,
+            lengths,
+            candidate_count,
+            CANDIDATE_BLOCK_SIZE,
+            candidates,
+            ragged_topk=ragged,
+        )
+        apply_candidate_mask(
+            logits,
+            None,
+            lengths,
+            candidates,
+            CANDIDATE_BLOCK_SIZE,
+            mask_tail=not ragged,
+        )
+        topk = torch.empty((rows, topk_tokens), device=device, dtype=torch.int32)
+        get_indexer_topk("per_row")(logits, lengths, 1, topk, topk_tokens, width)
+        if ragged:
+            mask_invalid_topk(logits, lengths, topk)
+        else:
+            scores = logits.gather(1, topk.clamp_min(0).long())
+            topk.masked_fill_(scores == -torch.inf, -1)
+        return candidates, topk
+
+    for _ in range(3):
+        run(True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run(True)
+    values = [0, 1, 127, 512, 8193, 32767]
+    for values in (values, values[::-1]):
+        lengths.copy_(torch.tensor(values, device=device, dtype=torch.int32))
+        expected = run(False)
+        graph.replay()
+        for result, reference in zip(actual, expected):
+            torch.testing.assert_close(
+                result.sort(dim=-1).values, reference.sort(dim=-1).values
+            )
 
 
 def _attention_cache(table, page_size, lengths):

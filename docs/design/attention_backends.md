@@ -270,7 +270,11 @@ restores Engram lookback from the request's token history. This also works with
 image inputs and fixed DSpark5 under `FULL_AND_PIECEWISE`.
 
 The indexer uses FP8 keys and FP32 logits, including when it masks logits
-to the selected candidate blocks. Its top-k options are `auto` (per row),
+to the selected candidate blocks. With `auto` and `per_row`, scoring, candidate
+selection, and masking visit only each request's causal columns. CUDA Graphs
+reserve fixed-capacity buffers but do not initialize the unused logits tail.
+The `torch` reference path initializes that tail for its full-width top-k.
+Its top-k options are `auto` (per row),
 `per_row`, and `torch`. The official Flash-1017 checkpoint can use its
 built-in DSpark drafter with the V2 runner in eager or either CUDA Graph
 mode. The graph modes capture uniform target verification batches and the draft
