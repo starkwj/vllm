@@ -276,6 +276,9 @@ built-in DSpark drafter with the V2 runner in eager or either CUDA Graph
 mode. The graph modes capture uniform target verification batches and the draft
 step. Pass
 `--speculative-config '{"method":"dspark","num_speculative_tokens":5,"enable_adaptive_verification":false}'`.
+SM80 decode uses split-K attention for both ordinary decode and multi-request
+DSpark verification, without an additional flag. The split count decreases as
+query parallelism grows, reaching one split for sufficiently large batches.
 Image inputs use the checkpoint's existing ViT and aligner, with causal SWA
 for image spans. On A100, `--mm-encoder-attn-backend TRITON_ATTN` selects the
 vision attention backend. Omit `--language-model-only` and set

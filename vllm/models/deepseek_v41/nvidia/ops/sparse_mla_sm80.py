@@ -205,10 +205,13 @@ def sparse_mla_sm80(
     rows, heads, _ = q.shape
     head_blocks = triton.cdiv(heads, head_tile)
     num_splits, key_tile, num_stages = 1, 32, 3
-    # A small decode grid underfills SM80. Split the KV tiles without changing
-    # prefill or larger decode grids.
-    if is_decode and rows * head_blocks <= 8:
-        num_splits = 32 if compress_ratio else 8
+    # Include multi-request DSpark verification grids, and reduce the split
+    # count as more query rows fill the device.
+    if is_decode:
+        split_limit = 32 if compress_ratio else 8
+        num_splits = min(
+            split_limit, max(1, 256 // triton.next_power_of_2(rows * head_blocks))
+        )
         key_tile, num_stages = 16, 1
     # Two FP32 statistics follow each partial vector. Keep the vectors aligned.
     partial_stride = 516

@@ -274,11 +274,12 @@ def _attention_cache(table, page_size, lengths):
 
 
 @pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("rows", [4, 12, 24, 48, 64, 66, 72, 96, 128, 256, 384])
 @torch.inference_mode()
-def test_sm80_split_decode_preserves_masked_paged_attention(ratio):
+def test_sm80_split_decode_preserves_masked_paged_attention(ratio, rows):
     torch.manual_seed(13)
     device = torch.device("cuda")
-    rows, heads = 4, 8
+    heads = 8
     swa_table = torch.tensor([[1, 0]], device=device, dtype=torch.int32)
     comp_table = swa_table.new_tensor([[5, 1, 2, 0, 4, 3, 7, 6]])
     swa_page, comp_page = BLOCK_SIZE, BLOCK_SIZE // ratio
@@ -287,14 +288,15 @@ def test_sm80_split_decode_preserves_masked_paged_attention(ratio):
         comp_table, comp_page, comp_table.new_tensor([comp_page * 8])
     )
 
-    positions = torch.tensor([0, 256, 1023, 1024], device=device)
+    repeats = (rows + 3) // 4
+    positions = torch.tensor([0, 256, 1023, 1024], device=device).repeat(repeats)[:rows]
     swa_cols = torch.arange(WINDOW, device=device)
     swa_slots = swa_table[0, (swa_cols + 73) // swa_page] * swa_page
     swa_slots += (swa_cols + 73) % swa_page
     swa_slots = swa_slots.int().repeat(rows, 1)
     swa_slots[0] = -1
     swa_slots[3, ::5] = -1
-    swa_lens = swa_slots.new_tensor([0, WINDOW, 17, WINDOW])
+    swa_lens = swa_slots.new_tensor([0, WINDOW, 17, WINDOW]).repeat(repeats)[:rows]
 
     cols = torch.arange(512, device=device)
     comp_slots = comp_table[0, cols // comp_page] * comp_page + cols % comp_page
