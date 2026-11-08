@@ -7,6 +7,7 @@ from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import has_deep
 from vllm.model_executor.layers.indexer_topk import (
     deep_select_topk,
     get_deep_select_stride_requirement,
+    get_indexer_topk,
     is_deep_select_supported,
 )
 from vllm.triton_utils import tl, triton
@@ -90,26 +91,81 @@ def _store_candidates_kernel(
     )
 
 
+@triton.jit
+def _mask_invalid_topk_kernel(
+    logits,
+    lengths,
+    indices,
+    logit_stride,
+    length_stride,
+    index_stride,
+    width,
+    K: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    index = tl.load(indices + row * index_stride + cols, cols < K, -1)
+    length = tl.minimum(tl.load(lengths + row * length_stride), width)
+    valid = (cols < K) & (index >= 0) & (index < length)
+    score = tl.load(logits + row * logit_stride + index, valid, -float("inf"))
+    tl.store(
+        indices + row * index_stride + cols,
+        tl.where(valid & (score != -float("inf")), index, -1),
+        cols < K,
+    )
+
+
+def mask_invalid_topk(
+    logits: torch.Tensor, lengths: torch.Tensor, indices: torch.Tensor
+) -> None:
+    """Discard masked selections without reading unwritten, out-of-range columns."""
+    rows, k = indices.shape
+    assert logits.stride(1) == indices.stride(1) == 1
+    _mask_invalid_topk_kernel[(rows, triton.cdiv(k, 256))](
+        logits,
+        lengths,
+        indices,
+        logits.stride(0),
+        lengths.stride(0),
+        indices.stride(0),
+        logits.shape[1],
+        k,
+        256,
+    )
+
+
 @triton.jit(do_not_specialize=["width", "nblocks"])
 def _candidate_flags_kernel(
     candidates,
     starts,
+    ends,
     flags,
     stride_row,
     stride_col,
     stride_start,
+    stride_end,
     width,
     nblocks,
     BLOCK_SIZE: tl.constexpr,
     K: tl.constexpr,
     HAS_STARTS: tl.constexpr,
     ROW_REPEAT: tl.constexpr,
+    MASK_TAIL: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     offsets = tl.arange(0, 1024)
-    for tile in range(tl.cdiv(nblocks + 1, 1024)):
+    valid_blocks = nblocks
+    if not MASK_TAIL:
+        start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
+        end = tl.load(ends + row // ROW_REPEAT * stride_end)
+        valid_blocks = tl.cdiv(
+            tl.maximum(tl.minimum(end, width) - start, 0), BLOCK_SIZE
+        )
+    for tile in range(tl.cdiv(valid_blocks, 1024)):
         slots = tile * 1024 + offsets
-        tl.store(flags + row * (nblocks + 1) + slots, 0, slots <= nblocks)
+        tl.store(flags + row * (nblocks + 1) + slots, 0, slots < valid_blocks)
+    tl.store(flags + row * (nblocks + 1) + nblocks, 0)
     start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
     cols = tl.arange(0, triton.next_power_of_2(K))
     block = tl.load(
@@ -118,7 +174,11 @@ def _candidate_flags_kernel(
     # Preserve the packed-column clamp for candidates beyond the logits width.
     block = tl.where(start + block * BLOCK_SIZE >= width, nblocks, block)
     tl.debug_barrier()
-    tl.store(flags + row * (nblocks + 1) + block, 1, (cols < K) & (block >= 0))
+    tl.store(
+        flags + row * (nblocks + 1) + block,
+        1,
+        (cols < K) & (block >= 0) & ((block < valid_blocks) | (block == nblocks)),
+    )
 
 
 @triton.jit(do_not_specialize=["width", "nblocks"])
@@ -137,21 +197,24 @@ def _mask_candidates_kernel(
     HAS_STARTS: tl.constexpr,
     ROW_REPEAT: tl.constexpr,
     TILE: tl.constexpr,
+    MASK_TAIL: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
-    cols = tl.program_id(1) * TILE + tl.arange(0, TILE)
     start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
     end = tl.load(ends + row // ROW_REPEAT * stride_end)
-    valid = (cols >= start) & (cols < end) & (cols < width)
-    block = (cols - start) // BLOCK_SIZE
-    keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
-    edge = tl.load(flags + row * (nblocks + 1) + nblocks)
-    keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
-    tl.store(
-        logits + row * stride_row + cols * stride_col,
-        -float("inf"),
-        (cols < width) & ~(valid & keep),
-    )
+    limit = width if MASK_TAIL else tl.minimum(end, width)
+    for tile in range(tl.program_id(1), tl.cdiv(limit, TILE), tl.num_programs(1)):
+        cols = tile * TILE + tl.arange(0, TILE)
+        valid = (cols >= start) & (cols < end) & (cols < width)
+        block = (cols - start) // BLOCK_SIZE
+        keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
+        edge = tl.load(flags + row * (nblocks + 1) + nblocks)
+        keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
+        tl.store(
+            logits + row * stride_row + cols * stride_col,
+            -float("inf"),
+            (cols < limit) & ~(valid & keep),
+        )
 
 
 def select_candidate_blocks(
@@ -163,6 +226,8 @@ def select_candidate_blocks(
     out: torch.Tensor,
     row_repeat: int = 1,
     score_dtype: torch.dtype | None = None,
+    *,
+    ragged_topk: bool = False,
 ) -> None:
     """Select local block IDs by maximum score, pinning each row's newest block.
 
@@ -178,6 +243,9 @@ def select_candidate_blocks(
         return
     nblocks = triton.cdiv(width, block_size)
     score_dtype = score_dtype or logits.dtype
+    if ragged_topk:
+        assert score_dtype == torch.float32
+        assert out.dtype == torch.int32 and out.is_contiguous()
     # Logits are max_model_len wide (CUDA-graph static) but rows are shorter:
     # DeepSelect stops at each row's valid block count. Order does not matter.
     use_deep_select = has_deep_select() and nblocks >= topk_blocks
@@ -209,8 +277,12 @@ def select_candidate_blocks(
         row_ks is not None,
         row_repeat,
         TILE=128,
-        FULL_WIDTH=not use_deep_select,
+        FULL_WIDTH=not (use_deep_select or ragged_topk),
     )
+    if ragged_topk:
+        get_indexer_topk("per_row")(scores, valid_blocks, 1, out, topk_blocks, nblocks)
+        mask_invalid_topk(scores, valid_blocks, out)
+        return
     if use_deep_select:
         deep_select_topk(scores, topk_blocks, end=valid_blocks, output_idx=out)
         return
@@ -234,6 +306,8 @@ def apply_candidate_mask(
     candidate_blocks: torch.Tensor,
     block_size: int,
     row_repeat: int = 1,
+    *,
+    mask_tail: bool = True,
 ) -> None:
     """Mask packed logits outside causal bounds and request-local candidates."""
     assert logits.is_cuda
@@ -246,17 +320,23 @@ def apply_candidate_mask(
     _candidate_flags_kernel[(rows,)](
         candidate_blocks,
         row_ks,
+        row_ke,
         flags,
         *candidate_blocks.stride(),
         start_stride,
+        row_ke.stride(0),
         width,
         nblocks,
         block_size,
         candidate_blocks.shape[1],
         row_ks is not None,
         row_repeat,
+        mask_tail,
     )
-    _mask_candidates_kernel[(rows, triton.cdiv(width, 1024))](
+    grid = triton.cdiv(width, 1024)
+    if not mask_tail:
+        grid = min(grid, 32)
+    _mask_candidates_kernel[(rows, grid)](
         logits,
         row_ks,
         row_ke,
@@ -270,4 +350,5 @@ def apply_candidate_mask(
         row_ks is not None,
         row_repeat,
         1024,
+        mask_tail,
     )

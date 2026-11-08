@@ -30,9 +30,20 @@ def _paged_mqa_logits(
     num_heads: tl.constexpr,
     head_tile: tl.constexpr,
     key_tile: tl.constexpr,
+    mask_tail: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     length = tl.load(Lengths + row)
+    valid_tiles = tl.cdiv(tl.minimum(width, length), key_tile)
+    if mask_tail:
+        for tile in range(
+            tl.program_id(1), tl.cdiv(width, key_tile), tl.num_programs(1)
+        ):
+            if tile >= valid_tiles:
+                cols = tile * key_tile + tl.arange(0, key_tile)
+                tl.store(Logits + row * width + cols, -float("inf"), cols < width)
+    if tl.program_id(1) >= valid_tiles:
+        return
     if Starts is not None:
         # A prefill chunk's row starts index the packed key space, but the
         # page table and output columns use request-local coordinates.
@@ -52,7 +63,7 @@ def _paged_mqa_logits(
     weight = tl.load(
         Weights + row * weight_row_stride + h * weight_head_stride, h < num_heads, 0
     )
-    for tile in range(tl.program_id(1), tl.cdiv(width, key_tile), tl.num_programs(1)):
+    for tile in range(tl.program_id(1), valid_tiles, tl.num_programs(1)):
         cols = tile * key_tile + tl.arange(0, key_tile)
         valid = (cols < width) & (cols < length)
         page_id = tl.load(
@@ -89,8 +100,10 @@ def paged_mqa_logits(
     width: int,
     starts: torch.Tensor | None = None,
     key_to_request: torch.Tensor | None = None,
+    *,
+    mask_tail: bool = True,
 ) -> torch.Tensor:
-    """Score each query over its own causal, request-local FP8 K columns."""
+    """Score request-local keys; with mask_tail=False only visible columns are valid."""
     rows, num_heads, head_dim = q.shape
     assert q.dtype == torch.float8_e4m3fn and head_dim == 128 and q.stride(2) == 1
     assert cache.dtype == torch.uint8 and cache.shape[2] == head_dim + 4
@@ -121,6 +134,7 @@ def paged_mqa_logits(
         num_heads,
         max(16, triton.next_power_of_2(num_heads)),
         key_tile,
+        mask_tail,
         num_warps=4,
     )
     return logits

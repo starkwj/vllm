@@ -8,6 +8,7 @@ from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     apply_candidate_mask,
+    mask_invalid_topk,
     select_candidate_blocks,
 )
 from vllm.model_executor.kernels.attention.dsa.triton_mqa_logits import paged_mqa_logits
@@ -60,6 +61,7 @@ class DeepseekV41TritonSparseAttnIndexer(SparseAttnIndexer):
         starts: torch.Tensor | None = None,
         key_to_request: torch.Tensor | None = None,
     ) -> None:
+        ragged = self.topk_backend != "torch"
         logits = paged_mqa_logits(
             q[rows],
             self.k_cache.kv_cache,
@@ -69,6 +71,7 @@ class DeepseekV41TritonSparseAttnIndexer(SparseAttnIndexer):
             width,
             starts,
             key_to_request,
+            mask_tail=not ragged,
         )
         if self.candidate_blocks is not None:
             candidates = self.candidate_blocks[rows]
@@ -80,10 +83,16 @@ class DeepseekV41TritonSparseAttnIndexer(SparseAttnIndexer):
                     candidates.shape[1],
                     self.candidate_block_size,
                     candidates,
+                    ragged_topk=ragged,
                 )
             else:
                 apply_candidate_mask(
-                    logits, None, lengths, candidates, self.candidate_block_size
+                    logits,
+                    None,
+                    lengths,
+                    candidates,
+                    self.candidate_block_size,
+                    mask_tail=not ragged,
                 )
         topk = self.topk_indices_buffer[rows, : self.topk_tokens]
         if self.topk_backend == "torch":
@@ -96,8 +105,7 @@ class DeepseekV41TritonSparseAttnIndexer(SparseAttnIndexer):
             )
             # The selector can return masked columns when there are fewer
             # candidates than topk. Preserve the missing-entry sentinel.
-            scores = logits.gather(1, topk.clamp_min(0).long())
-            topk.masked_fill_(scores == -torch.inf, -1)
+            mask_invalid_topk(logits, lengths, topk)
 
     def forward_cuda(
         self,
