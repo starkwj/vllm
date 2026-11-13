@@ -314,6 +314,7 @@ def mhc_fused_post_pre_delayed_tilelang(
         _HC_PRENORM_GEMM_TILELANG_KERNEL,
         _MHC_FUSED_TILELANG_KERNEL,
         _MHC_POST_TILELANG_KERNEL,
+        mhc_delayed_sm80_prenorm_config,
         mhc_fused_post_pre_split_config,
         mhc_pre_big_fuse_tilelang,
     )
@@ -396,9 +397,12 @@ def mhc_fused_post_pre_delayed_tilelang(
         # The delayed epilogue is compiled per bucketed split count, so the
         # projection has to use the same bucket rather than the raw estimate.
         use_deep_gemm = is_deep_gemm_supported()
-        n_splits = (
-            compute_mhc_pre_num_splits(input_size, num_tokens) if use_deep_gemm else 1
-        )
+        if use_deep_gemm:
+            n_splits = compute_mhc_pre_num_splits(input_size, num_tokens)
+        else:
+            tile_n, n_splits, n_thr = mhc_delayed_sm80_prenorm_config(
+                hidden_size, hc_mult
+            )
         mixes = torch.empty(
             n_splits, num_tokens, mix_size, dtype=torch.float32, device=residual.device
         )
@@ -416,6 +420,9 @@ def mhc_fused_post_pre_delayed_tilelang(
                 sqrsum,
                 input_size,
                 1,
+                tile_n=tile_n,
+                n_thr=n_thr,
+                n_splits=n_splits,
             )
 
     outputs = (

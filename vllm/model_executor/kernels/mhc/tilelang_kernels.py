@@ -137,6 +137,22 @@ def mhc_fused_post_pre_splits(hidden_size: int, hc_mult: int) -> tuple[int, ...]
     return tuple(sorted({config[1] for config in configs if config is not None}))
 
 
+@cache
+def mhc_delayed_sm80_prenorm_config(
+    hidden_size: int, hc_mult: int
+) -> tuple[int, int, int]:
+    """Pick (tile_n, n_splits, n_thr) for the unfused delayed projection."""
+    if (
+        hidden_size == 5120
+        and hc_mult == 4
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(80)
+    ):
+        # Smaller CTAs let each SM run more projection tiles concurrently.
+        return 8, 4, 128
+    return 12, 1, 512
+
+
 @tilelang_jit
 def mhc_pre_big_fuse_tilelang(
     gemm_out_mul,
