@@ -398,8 +398,10 @@ def mhc_fused_post_pre_delayed_ref(
 
 
 @pytest.mark.skipif(not HAS_TILELANG_MHC, reason="TileLang MHC support required")
-@pytest.mark.parametrize("num_tokens", [0, 1, 8, 128])
-@pytest.mark.parametrize("hidden_size", [4096, 7168])
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size",
+    [(m, h) for m in (0, 1, 8, 128) for h in (4096, 7168)] + [(48, 5120)],
+)
 @pytest.mark.parametrize("carried", [False, True])
 def test_deepseek_v41_mhc_fused_post_pre_delayed(num_tokens, hidden_size, carried):
     """Fold the post block into the delayed pre without changing its outputs."""

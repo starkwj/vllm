@@ -417,6 +417,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_post_alpha = 2.0
         if vllm_config.kernel_config.enable_jit_warmup and current_platform.is_cuda():
             from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+                mhc_delayed_sm80_prenorm_config,
                 mhc_fused_post_pre_splits,
             )
             from vllm.model_executor.kernels.mhc.warmup import MHC_PRE_NORM_KERNEL
@@ -439,8 +440,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             }
             hc_stream = {
                 "rms_numel": self.hc_mult * self.hidden_size,
-                "extra_splits": mhc_fused_post_pre_splits(
-                    self.hidden_size, self.hc_mult
+                "extra_splits": (
+                    *mhc_fused_post_pre_splits(self.hidden_size, self.hc_mult),
+                    mhc_delayed_sm80_prenorm_config(self.hidden_size, self.hc_mult)[1],
                 ),
             }
             variants = [
