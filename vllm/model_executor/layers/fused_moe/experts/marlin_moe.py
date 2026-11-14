@@ -4,11 +4,18 @@
 
 import math
 from collections.abc import Callable
+from typing import TYPE_CHECKING, cast
 
 import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.forward_context import (
+    get_forward_context,
+    in_piecewise_cudagraph,
+    is_forward_context_available,
+)
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
     MoEActivation,
@@ -23,6 +30,10 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
     LoRAExpertsMixin,
+)
+from vllm.model_executor.layers.fused_moe.experts.marlin_sm80_route_pack import (
+    MAX_SM80_ROUTE_PACK_ROUTES,
+    marlin_sm80_route_pack,
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
@@ -54,6 +65,26 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+
+def _capture_sm80_route_pack(swa_prefix: str, rows: int) -> bool:
+    if (
+        not is_forward_context_available()
+        or in_piecewise_cudagraph()
+        or not torch.cuda.is_current_stream_capturing()
+    ):
+        return False
+    # Runner V2 calls the model with mode NONE inside a FULL capture.
+    metadata = get_forward_context().attn_metadata
+    if not isinstance(metadata, dict):
+        return False
+    swa = cast("DeepseekSparseSWAMetadata | None", metadata.get(swa_prefix))
+    return swa is not None and swa.num_prefills == 0 and swa.num_decode_tokens == rows
 
 
 def _fused_marlin_moe(
@@ -222,6 +253,7 @@ def fused_marlin_moe(
     output: torch.Tensor | None = None,
     activation_config: ApplyMoEActivationConfig | None = None,
     mul_topk_weights_in_gemm2: bool = True,
+    sm80_route_pack_swa_prefix: str | None = None,
 ) -> torch.Tensor:
     """This function computes a Mixture of Experts (MoE) layer using two sets of
     weights, w1 and w2, and top-k gating mechanism.
@@ -263,6 +295,8 @@ def fused_marlin_moe(
         activation_config (ApplyMoEActivationConfig|None): Extra
             configuration forwarded to the activation.
         mul_topk_weights_in_gemm2 (bool): Apply top-k weights in GEMM2.
+        sm80_route_pack_swa_prefix (str|None): SWA metadata key used to recognize
+            eligible decode graphs for the SM80 route pack.
 
     Returns:
         torch.Tensor: The output tensor after applying the MoE layer.
@@ -310,13 +344,29 @@ def fused_marlin_moe(
         if M * topk / E / block_size_m < 0.9:
             break
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids,
-        block_size_m,
-        global_num_experts,
-        expert_map,
-        ignore_invalid_experts=True,
-    )
+    if (
+        sm80_route_pack_swa_prefix is not None
+        and block_size_m == 8
+        and 0 < topk_ids.numel() <= MAX_SM80_ROUTE_PACK_ROUTES
+        and topk_ids.is_contiguous()
+        and _capture_sm80_route_pack(sm80_route_pack_swa_prefix, topk_ids.size(0))
+    ):
+        logger.info_once(
+            "Capturing SM80 fused Marlin route packing (%d target rows, top-k %d).",
+            topk_ids.size(0),
+            topk,
+        )
+        sorted_token_ids, expert_ids, num_tokens_post_padded = marlin_sm80_route_pack(
+            topk_ids, global_num_experts, expert_map
+        )
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            expert_map,
+            ignore_invalid_experts=True,
+        )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -736,6 +786,9 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 intermediate_cache13=workspace2,
                 intermediate_cache2=workspace13,
                 mul_topk_weights_in_gemm2=not hooked,
+                sm80_route_pack_swa_prefix=(
+                    self.moe_config.marlin_sm80_route_pack_swa_prefix
+                ),
             )
             return
 

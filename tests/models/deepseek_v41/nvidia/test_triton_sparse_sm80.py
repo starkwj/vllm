@@ -414,16 +414,22 @@ def _logical_topk(logits):
     return indices.masked_fill(scores == -torch.inf, -1)
 
 
+@pytest.mark.parametrize("draft_tokens", [3, 5])
 @torch.inference_mode()
-def test_sm80_dspark_draft_sees_future_block_tokens(model_path, monkeypatch):
+def test_sm80_dspark_draft_sees_future_block_tokens(
+    model_path, monkeypatch, draft_tokens
+):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     config = _engine_args(
-        model_path, enforce_eager=True, speculative_config=DSPARK_CONFIG
+        model_path,
+        enforce_eager=True,
+        speculative_config={**DSPARK_CONFIG, "num_speculative_tokens": draft_tokens},
     ).create_engine_config()
+    _select_dsv4_attn_cls(config, is_dspark_draft=True)
     device = torch.device("cuda")
     page_size = 32
     common = create_common_attn_metadata(
-        BatchSpec(seq_lens=[133, 6], query_lens=[5, 5]),
+        BatchSpec(seq_lens=[133, 6], query_lens=[draft_tokens, draft_tokens]),
         page_size,
         device,
         arange_block_indices=True,
@@ -448,7 +454,7 @@ def test_sm80_dspark_draft_sees_future_block_tokens(model_path, monkeypatch):
     quantize_and_insert_k_cache(
         values, cache.flatten(1), torch.arange(len(values), device=device), page_size
     )
-    q = torch.zeros((10, 8, 512), device=device, dtype=torch.bfloat16)
+    q = torch.zeros((2 * draft_tokens, 8, 512), device=device, dtype=torch.bfloat16)
     out = torch.empty_like(q)
     assert meta.decode_swa_indices is not None and meta.decode_swa_lens is not None
     sparse_mla_sm80(
@@ -463,7 +469,10 @@ def test_sm80_dspark_draft_sees_future_block_tokens(model_path, monkeypatch):
         is_decode=True,
     )
     expected = torch.cat(
-        (torch.full_like(out[:5], 1 / 133), torch.full_like(out[5:], 2 / 6))
+        (
+            torch.full_like(out[:draft_tokens], 1 / (WINDOW + draft_tokens)),
+            torch.full_like(out[draft_tokens:], 2 / 6),
+        )
     )
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 

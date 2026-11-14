@@ -8,10 +8,14 @@ Run `pytest tests/kernels/moe/test_moe_align_block_size.py`.
 import pytest
 import torch
 
+from vllm.model_executor.layers.fused_moe.experts.marlin_sm80_route_pack import (
+    marlin_sm80_route_pack,
+)
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
 )
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import set_random_seed
 
@@ -126,6 +130,49 @@ def _verify_expert_level_sorting(
             f"golden={golden_expert_tokens[expert_id]}, "
             f"actual={actual_expert_tokens[expert_id]}"
         )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("num_experts,use_expert_map", [(384, True), (32, False)])
+@pytest.mark.parametrize(
+    "rows,topk", [(1, 1), (1, 6), (4, 6), (6, 6), (12, 6), (16, 8)]
+)
+def test_marlin_route_pack_replay(num_experts, use_expert_map, rows, topk):
+    """Replay after the routes change, including padding and no valid routes."""
+    expert_map = None
+    if use_expert_map:
+        expert_map = torch.full((num_experts,), -1, device="cuda", dtype=torch.int32)
+        expert_map[:48] = torch.arange(48, device="cuda", dtype=torch.int32)
+    num_routes = rows * topk
+    ids = torch.full((num_routes + 1,), -1, device="cuda", dtype=torch.int32)
+    ids = ids[1:].view(rows, topk)
+    marlin_sm80_route_pack(ids, num_experts, expert_map)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = marlin_sm80_route_pack(ids, num_experts, expert_map)
+
+    mixed = torch.arange(num_routes, device="cuda", dtype=torch.int32) % num_experts
+    mixed[::2] = 1  # Larger batches span multiple blocks for the same expert.
+    if num_routes >= 4:
+        mixed[1:4] = torch.tensor(
+            [-1, num_experts - 1, num_experts], device="cuda", dtype=torch.int32
+        )
+    for routes in (mixed.view_as(ids), torch.full_like(ids, -1)):
+        ids.copy_(routes)
+        expected = moe_align_block_size(
+            ids, 8, num_experts, expert_map, ignore_invalid_experts=True
+        )
+        graph.replay()
+        count = int(expected[2].item())
+        assert torch.equal(actual[2], expected[2])
+        assert torch.equal(actual[1][: count // 8], expected[1][: count // 8])
+        _verify_expert_level_sorting(
+            actual[0], expected[0], expected[1], 8, count, ids.numel()
+        )
+        blocks = actual[0][:count].view(-1, 8)
+        assert (blocks >= 0).all() and (blocks <= ids.numel()).all()
+        assert (blocks[:, 1:].eq(ids.numel()) | blocks[:, :-1].ne(ids.numel())).all()
 
 
 def torch_moe_align_block_size(

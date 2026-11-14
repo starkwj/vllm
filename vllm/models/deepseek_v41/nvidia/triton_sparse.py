@@ -122,12 +122,11 @@ class DeepseekV41TritonSparseMLAAttention(DeepseekV4Attention):
         if spec is not None and (
             not vllm_config.use_v2_model_runner
             or not spec.use_dspark()
-            or spec.num_speculative_tokens != 5
             or spec.enable_adaptive_verification
         ):
             raise ValueError(
-                f"{name} speculative decoding requires V2 DSpark with five "
-                "draft tokens and adaptive verification disabled."
+                f"{name} speculative decoding requires V2 DSpark with "
+                "adaptive verification disabled."
             )
         if attention.use_non_causal and not is_dspark_draft:
             raise ValueError(f"{name} requires causal attention.")

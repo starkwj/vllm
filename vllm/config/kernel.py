@@ -355,6 +355,13 @@ class KernelConfig:
                    running QDQ on activations.
     """
 
+    enable_marlin_sm80_fused_route_pack: bool = False
+    """Enable fused expert route packing for DeepSeek-V4.1 target decode on
+    SM80 when Marlin uses eight-row expert blocks and the FULL CUDA graph has
+    at most 128 routing entries (captured token rows times router top-k). Use with
+    `--kernel-config.enable_marlin_sm80_fused_route_pack true`.
+    """
+
     sparse_indexer_topk_backend: SparseIndexerTopkBackend = "auto"
     """Backend for the DSA sparse indexer decode top-k kernel. Available options:
 

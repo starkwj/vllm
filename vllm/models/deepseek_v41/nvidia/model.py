@@ -408,6 +408,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             use_sequence_parallel=self.use_sequence_parallel,
             reduce_results=not fuse_mhc_all_reduce,
         )
+        if (
+            not is_dspark_draft
+            and vllm_config.kernel_config.enable_marlin_sm80_fused_route_pack
+            and isinstance(self.attn, DeepseekV41TritonSparseMLAAttention)
+        ):
+            self.ffn.experts.moe_config.marlin_sm80_route_pack_swa_prefix = (
+                self.attn.swa_cache_layer.prefix
+            )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
