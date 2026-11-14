@@ -5,7 +5,9 @@ Tokens are drawn by inverse CDF of softmax(cached logits / temperature), one exp
 per logit instead of Gumbel-max's hash and two logs; temperature 0 is argmax."""
 
 import torch
+import torch.nn.functional as F
 
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.triton_utils import LOG2E, tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import (
     _DRAFT_NOISE_SALT,
@@ -15,6 +17,112 @@ from vllm.v1.worker.gpu.sample.gumbel import (
 
 _BLOCK_SIZE = 2048
 _LOG2E = tl.constexpr(LOG2E)
+
+
+@triton.jit(do_not_specialize=["step"])
+def _greedy_markov_partials(
+    base,
+    bias,
+    packets,
+    step,
+    steps: tl.constexpr,
+    vocab: tl.constexpr,
+    stride: tl.constexpr,
+    blocks: tl.constexpr,
+    block: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    part = tl.program_id(1)
+    col = part * block + tl.arange(0, block)
+    a = tl.load(base + (row * steps + step) * stride + col, col < vocab, 0)
+    b = tl.load(bias + row * vocab + col, col < vocab, 0)
+    # Match the materialized BF16 addition before comparing logits.
+    value = (a.to(tl.float32) + b.to(tl.float32)).to(a.dtype).to(tl.float32)
+    value = tl.where((col < vocab) & (value == value), value, -float("inf"))
+    maximum, index = tl.max(value, axis=0, return_indices=True)
+    packet = packets + (row * blocks + part) * 2
+    tl.store(packet, maximum)
+    tl.store(packet + 1, (part * block + index).to(tl.float32))
+
+
+@triton.jit(do_not_specialize=["step", "rows"])
+def _greedy_markov_finish(
+    packets,
+    tokens,
+    embedding,
+    next_embedding,
+    step,
+    rows,
+    steps: tl.constexpr,
+    vocab: tl.constexpr,
+    width: tl.constexpr,
+    blocks: tl.constexpr,
+    parts: tl.constexpr,
+    block: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    part = tl.arange(0, block)
+    packet = packets + ((part // blocks * rows + row) * blocks + part % blocks) * 2
+    values = tl.load(packet, part < parts, -float("inf"))
+    # Packets are ordered by rank and then by block, in global vocab order.
+    winner = tl.argmax(values, axis=0, tie_break_left=True)
+    rank = winner // blocks
+    selected = packets + ((rank * rows + row) * blocks + winner % blocks) * 2
+    token = tl.load(selected + 1).to(tl.int64) + rank * vocab
+    tl.store(tokens + row * steps + step, token)
+    if step + 1 < steps:
+        d = tl.arange(0, triton.next_power_of_2(width))
+        embed = tl.load(embedding + token * width + d, d < width, 0)
+        tl.store(next_embedding + row * width + d, embed, d < width)
+
+
+def greedy_markov_vocab_parallel(
+    base: torch.Tensor,
+    embedding: torch.Tensor,
+    bias_weight_shard: torch.Tensor,
+    anchors: torch.Tensor,
+    tokens: torch.Tensor,
+    tp_size: int,
+) -> None:
+    """Sample from equal, contiguous BF16 vocab shards in global vocab order."""
+    rows, steps = tokens.shape
+    vocab = base.shape[-1]
+    blocks = triton.cdiv(vocab, _BLOCK_SIZE)
+    parts = blocks * tp_size
+    packets = torch.empty((rows, blocks, 2), dtype=torch.float32, device=base.device)
+    embed = F.embedding(anchors, embedding)
+    next_embed = torch.empty_like(embed)
+    for step in range(steps):
+        bias = F.linear(embed, bias_weight_shard)
+        _greedy_markov_partials[(rows, blocks)](
+            base,
+            bias,
+            packets,
+            step,
+            steps,
+            vocab,
+            base.stride(0),
+            blocks,
+            _BLOCK_SIZE,
+            num_warps=2,
+        )
+        gathered = tensor_model_parallel_all_gather(packets, dim=0)
+        _greedy_markov_finish[(rows,)](
+            gathered,
+            tokens,
+            embedding,
+            next_embed,
+            step,
+            rows,
+            steps,
+            vocab,
+            embedding.shape[1],
+            blocks,
+            parts,
+            triton.next_power_of_2(parts),
+            num_warps=4,
+        )
+        embed = next_embed
 
 
 @triton.jit(do_not_specialize=["step"])
