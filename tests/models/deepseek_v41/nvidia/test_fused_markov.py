@@ -70,6 +70,88 @@ def test_greedy_and_cache_match_loop():
     assert torch.equal(cache[:, 0], ref_cache[:, 0])
 
 
+@torch.inference_mode()
+def _greedy_shard_worker(rank: int, port: int) -> None:
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.models.deepseek_v41.nvidia.ops.fused_markov import (
+        greedy_markov_vocab_parallel,
+    )
+    from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
+
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(
+            world_size=2,
+            rank=rank,
+            distributed_init_method=f"tcp://127.0.0.1:{port}",
+            local_rank=rank,
+        )
+        initialize_model_parallel(tensor_model_parallel_size=2)
+        rows, shard_size = 3, VOCAB // 8
+        vocab_size = 2 * shard_size
+        generator = torch.Generator(device=device).manual_seed(17)
+        kwargs = dict(generator=generator, device=device, dtype=torch.bfloat16)
+        base = torch.randn(rows * N_SPEC, vocab_size, **kwargs)
+        embedding = torch.randn(vocab_size, RANK, **kwargs)
+        bias_weight = torch.randn(vocab_size, RANK, **kwargs) * 0.03125
+        anchors = torch.arange(rows, device=device)
+        out = torch.empty(rows, N_SPEC, dtype=torch.int64, device=device)
+        local_base = base.chunk(2, dim=1)[rank].contiguous()
+        local_weight = bias_weight.chunk(2, dim=0)[rank]
+
+        def sample():
+            greedy_markov_vocab_parallel(
+                local_base, embedding, local_weight, anchors, out, tp_size=2
+            )
+
+        sample()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            sample()
+        for edge in (False, True):
+            if edge:
+                # Exercise ties across rank/block boundaries, NaNs, and the
+                # last valid column of a partially filled block.
+                bias_weight.zero_()
+                base[:N_SPEC].fill_(-torch.inf)
+                base[:N_SPEC, [4095, 4096, shard_size]] = 1
+                base[:N_SPEC, 0] = torch.nan
+                base[N_SPEC : 2 * N_SPEC].fill_(-torch.inf)
+                base[2 * N_SPEC :, -1] = torch.inf
+                local_base.copy_(base.chunk(2, dim=1)[rank])
+            graph.replay()
+            expected = []
+            prev = anchors
+            for step in range(N_SPEC):
+                bias = F.linear(F.embedding(prev, embedding), bias_weight)
+                prev = greedy_argmax(base[step::N_SPEC] + bias)
+                expected.append(prev)
+            assert torch.equal(out, torch.stack(expected, dim=1))
+        torch.cuda.synchronize()
+        del graph
+        cleanup_dist_env_and_memory()
+
+
+@pytest.mark.distributed(num_gpus=2)
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(80)
+    or torch.cuda.device_count() < 2,
+    reason="requires two SM80 GPUs",
+)
+def test_greedy_markov_shards_preserve_token_order():
+    from vllm.utils.network_utils import get_open_port
+
+    torch.multiprocessing.spawn(
+        _greedy_shard_worker, args=(get_open_port(),), nprocs=2
+    )
+
+
 def test_sampled_tokens_follow_softmax():
     temp = 0.6
     row = (torch.randn(VOCAB, device="cuda") * 3).to(torch.bfloat16)

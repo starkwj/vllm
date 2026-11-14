@@ -11,6 +11,7 @@ include the future query tokens in the top-k indices for each query token.
 """
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import regex as re
 import torch
@@ -36,6 +37,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.mtp_validation import (
@@ -53,6 +55,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v4.nvidia.dspark import _duplicate_context_wkv_weights
+from vllm.platforms import current_platform
 
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from .model import (
@@ -64,7 +67,10 @@ from .model import (
     maybe_init_gemm_rs,
     prepare_mega_gate_routing_metadata,
 )
-from .ops.fused_markov import FusedMarkovSampler
+from .ops.fused_markov import FusedMarkovSampler, greedy_markov_vocab_parallel
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 logger = init_logger(__name__)
 
@@ -341,6 +347,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 self.config.dspark_markov_rank,
                 self.draft_model_config.dtype,
             )
+        elif (
+            current_platform.is_device_capability(80)
+            and vllm_config.parallel_config.tensor_parallel_size > 1
+            and not vllm_config.parallel_config.enable_batch_sharded_sampling
+            and spec_config.draft_sample_method == "greedy"
+            and not spec_config.enable_adaptive_verification
+            and not envs.VLLM_BATCH_INVARIANT
+        ):
+            self.sample_sequential = self._sample_greedy_vocab_parallel
 
     # --- Hooks used by the speculator -------------------------------------
 
@@ -387,6 +402,45 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         return self.logits_processor(
             self.lm_head, self.model.norm(hidden_states), skip_gather=True
         )
+
+    def _sample_greedy_vocab_parallel(
+        self, spec: "DSparkSpeculator", num_reqs: int, head_hidden: torch.Tensor
+    ) -> bool:
+        lm_head = self.lm_head
+        markov = self.model.markov_head
+        vocab_size = self.config.vocab_size
+        if (
+            not num_reqs
+            or spec.draft_logits is not None
+            or spec.use_confidence_head
+            or spec.use_acceptance_estimator
+            or lm_head.tp_size != spec.vllm_config.parallel_config.tensor_parallel_size
+            or lm_head.org_vocab_size != vocab_size
+            or lm_head.num_embeddings_padded != vocab_size
+            or not isinstance(markov.markov_w2.quant_method, UnquantizedEmbeddingMethod)
+            or getattr(markov.markov_w2, "use_skinny_gemm", False)
+            or self.logits_processor.head_dtype not in (None, torch.bfloat16)
+            or head_hidden.dtype != torch.bfloat16
+        ):
+            return False
+
+        steps = spec.num_speculative_steps
+        base = self.compute_draft_logits_local(
+            head_hidden[spec.sample_indices[: num_reqs * steps]]
+        )
+        anchors = spec.input_buffers.input_ids[spec._anchor_idx[:num_reqs]]
+        shard = lm_head.shard_indices
+        # Keep the original weights and project only this rank's vocabulary.
+        bias_weight = markov.markov_w2.weight
+        greedy_markov_vocab_parallel(
+            base,
+            markov.markov_w1.weight,
+            bias_weight[shard.org_vocab_start_index : shard.org_vocab_end_index],
+            anchors,
+            spec.draft_tokens[:num_reqs],
+            lm_head.tp_size,
+        )
+        return True
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids  # full-vocab: draft ids are target ids
