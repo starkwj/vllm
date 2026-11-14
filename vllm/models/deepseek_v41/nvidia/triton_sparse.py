@@ -120,13 +120,11 @@ class DeepseekV41TritonSparseMLAAttention(DeepseekV4Attention):
             raise ValueError(f"{name} requires PCP and DCP sizes of 1.")
         spec = vllm_config.speculative_config
         if spec is not None and (
-            not spec.use_dspark()
-            or spec.num_speculative_tokens != 5
-            or spec.enable_adaptive_verification
+            not spec.use_dspark() or spec.enable_adaptive_verification
         ):
             raise ValueError(
-                f"{name} speculative decoding requires DSpark with five "
-                "draft tokens and adaptive verification disabled."
+                f"{name} speculative decoding requires DSpark with "
+                "adaptive verification disabled."
             )
         if attention.use_non_causal and not is_dspark_draft:
             raise ValueError(f"{name} requires causal attention.")

@@ -267,7 +267,7 @@ host lookups; it does not use `torch.compile`.
 cached across requests and rebuilds the sliding-window KV from the hit's last
 window. The runner masks writes to the cached groups during this replay and
 restores Engram lookback from the request's token history. This also works with
-image inputs and fixed DSpark5 under `FULL_AND_PIECEWISE`.
+image inputs and DSpark5 under `FULL_AND_PIECEWISE`.
 
 The indexer uses FP8 keys and FP32 logits, including when it masks logits
 to the selected candidate blocks. With `auto` and `per_row`, scoring, candidate
@@ -278,7 +278,7 @@ Its top-k options are `auto` (per row),
 `per_row`, and `torch`. The official Flash-1017 checkpoint can use its
 built-in DSpark drafter in eager or either CUDA Graph
 mode. The graph modes capture uniform target verification batches and the draft
-step. Pass
+step for the configured fixed draft length. For example, pass
 `--speculative-config '{"method":"dspark","num_speculative_tokens":5,"enable_adaptive_verification":false}'`.
 SM80 decode uses split-K attention for both ordinary decode and multi-request
 DSpark verification, without an additional flag. The split count decreases as
@@ -294,6 +294,13 @@ Encoder CUDA graphs have not been validated on this backend.
 Context parallelism and LoRA are unsupported. Checkpoint loading
 and MoE kernel support depend on the model's weight format and are separate
 from this backend.
+
+With Marlin, `--kernel-config.enable_marlin_sm80_fused_route_pack true` enables
+fused route packing in target decode FULL CUDA graphs that use eight-row expert
+blocks and contain at most 128 routes. The route count is the number of token rows
+in the captured graph times the router's top-k. This covers ordinary decode and
+small verification batches at different DSpark lengths. For example, a graph for
+two requests with five draft tokens each and top-k 6 has 72 routes.
 
 On eight A100s, the official DeepSeek-V4.1-Flash-1017 checkpoint can run
 directly with Marlin for the FP8 linears (W8A16) and MXFP4 routed experts

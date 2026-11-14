@@ -1336,6 +1336,7 @@ class FusedMoEConfig:
     intermediate_pad: int | None = None
 
     moe_backend: MoEBackend = "auto"
+    marlin_sm80_route_pack_swa_prefix: str | None = None
     max_num_tokens: int = SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP
     elastic_ep_max_dp_size: int | None = None
     has_bias: bool = False
