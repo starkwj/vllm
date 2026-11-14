@@ -83,7 +83,14 @@ def _paged_mqa_logits(
             0,
         )
         per_head = tl.maximum(tl.dot(q, key), 0.0)
-        scores = tl.sum(per_head * weight[:, None], 0) * scales
+        weighted = per_head * weight[:, None]
+        if key_tile == 128 and head_tile == 32:
+            # Preserve the narrow tile's two 16-head reductions. A 16-head
+            # tile already reduces each key within one warp.
+            groups = tl.reshape(weighted, (2, 16, key_tile))
+            scores = tl.sum(tl.sum(groups, 1), 0) * scales
+        else:
+            scores = tl.sum(weighted, 0) * scales
         tl.store(
             Logits + row * width + cols,
             tl.where(valid, scores, -float("inf")),
@@ -114,8 +121,13 @@ def paged_mqa_logits(
     logits = torch.empty((rows, width), dtype=torch.float32, device=q.device)
     if not rows or not width:
         return logits
-    key_tile = 32
-    _paged_mqa_logits[(rows, min(triton.cdiv(width, key_tile), 512))](
+    head_tile = max(16, triton.next_power_of_2(num_heads))
+    # Wider tiles amortize query dequantization and page lookup over more keys.
+    # Larger head tiles have a different reduction layout and register cost.
+    wide_decode = starts is None and width >= 512 and head_tile <= 32
+    key_tile = 128 if wide_decode else 32
+    grid_limit = 128 if wide_decode else 512
+    _paged_mqa_logits[(rows, min(triton.cdiv(width, key_tile), grid_limit))](
         q.view(torch.uint8),
         cache,
         weights,
@@ -132,7 +144,7 @@ def paged_mqa_logits(
         cache.shape[1],
         cache.stride(0),
         num_heads,
-        max(16, triton.next_power_of_2(num_heads)),
+        head_tile,
         key_tile,
         mask_tail,
         num_warps=4,
